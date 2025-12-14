@@ -1,0 +1,515 @@
+# Private Build Agents Configuration for Secure CI/CD
+# Self-hosted agents in private VNet for maximum security
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: azure-devops-agent
+  namespace: cicd-agents
+  labels:
+    app: azure-devops-agent
+    component: build-agent
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: azure-devops-agent
+  template:
+    metadata:
+      labels:
+        app: azure-devops-agent
+        component: build-agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: build-agent
+      nodeSelector:
+        nodepool: build
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: azure-devops-agent
+        image: mcr.microsoft.com/azure-pipelines/vsts-agent:ubuntu-20.04
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: AZP_URL
+          valueFrom:
+            secretKeyRef:
+              name: azure-devops-secrets
+              key: organization-url
+        - name: AZP_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: azure-devops-secrets
+              key: pat-token
+        - name: AZP_POOL
+          value: "private-agents"
+        - name: AZP_AGENT_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: AZP_WORK
+          value: "/azp/work"
+        - name: DOCKER_HOST
+          value: "tcp://localhost:2376"
+        - name: DOCKER_TLS_VERIFY
+          value: "1"
+        - name: DOCKER_CERT_PATH
+          value: "/certs/client"
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+          requests:
+            cpu: 1000m
+            memory: 2Gi
+        volumeMounts:
+        - name: work-dir
+          mountPath: /azp/work
+        - name: docker-certs
+          mountPath: /certs/client
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        livenessProbe:
+          exec:
+            command:
+            - pgrep
+            - Agent.Listener
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          exec:
+            command:
+            - pgrep
+            - Agent.Listener
+          initialDelaySeconds: 10
+          periodSeconds: 10
+
+      # Docker-in-Docker sidecar for container builds
+      - name: docker-dind
+        image: docker:24.0-dind
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: DOCKER_TLS_CERTDIR
+          value: "/certs"
+        - name: DOCKER_DRIVER
+          value: "overlay2"
+        securityContext:
+          privileged: true  # Required for Docker-in-Docker
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+          requests:
+            cpu: 500m
+            memory: 1Gi
+        volumeMounts:
+        - name: docker-certs
+          mountPath: /certs/client
+        - name: docker-storage
+          mountPath: /var/lib/docker
+        - name: tmp
+          mountPath: /tmp
+
+      # Security scanning tools sidecar
+      - name: security-tools
+        image: aquasec/trivy:0.48.0
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "sleep infinity"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          limits:
+            cpu: 500m
+            memory: 1Gi
+          requests:
+            cpu: 200m
+            memory: 512Mi
+        volumeMounts:
+        - name: trivy-cache
+          mountPath: /root/.cache/trivy
+        - name: tmp
+          mountPath: /tmp
+
+      volumes:
+      - name: work-dir
+        emptyDir:
+          sizeLimit: 10Gi
+      - name: docker-certs
+        emptyDir:
+          sizeLimit: 1Mi
+      - name: docker-storage
+        emptyDir:
+          sizeLimit: 20Gi
+      - name: trivy-cache
+        emptyDir:
+          sizeLimit: 5Gi
+      - name: tmp
+        emptyDir:
+          sizeLimit: 1Gi
+
+---
+# ServiceAccount for build agents
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: build-agent
+  namespace: cicd-agents
+  labels:
+    app: azure-devops-agent
+    component: build-agent
+    azure.workload.identity/use: "true"
+  annotations:
+    azure.workload.identity/client-id: "${BUILD_AGENT_IDENTITY_CLIENT_ID}"
+
+---
+# ClusterRole for build agents
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: build-agent
+  labels:
+    app: azure-devops-agent
+    component: build-agent
+rules:
+# Read access for deployment verification
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch", "patch"]
+# Limited write access for deployments
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["patch"]
+  resourceNames: ["web-app", "api-server"]  # Specific deployments only
+
+---
+# ClusterRoleBinding for build agents
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: build-agent
+  labels:
+    app: azure-devops-agent
+    component: build-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: build-agent
+subjects:
+- kind: ServiceAccount
+  name: build-agent
+  namespace: cicd-agents
+
+---
+# Secret for Azure DevOps configuration
+apiVersion: v1
+kind: Secret
+metadata:
+  name: azure-devops-secrets
+  namespace: cicd-agents
+  labels:
+    app: azure-devops-agent
+    component: build-agent
+type: Opaque
+data:
+  organization-url: "${BASE64_ORGANIZATION_URL}"
+  pat-token: "${BASE64_PAT_TOKEN}"
+
+---
+# GitHub Actions Runner Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-actions-runner
+  namespace: cicd-agents
+  labels:
+    app: github-actions-runner
+    component: build-agent
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: github-actions-runner
+  template:
+    metadata:
+      labels:
+        app: github-actions-runner
+        component: build-agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: github-runner
+      nodeSelector:
+        nodepool: build
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: github-runner
+        image: myoung34/github-runner:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: REPO_URL
+          valueFrom:
+            secretKeyRef:
+              name: github-secrets
+              key: repository-url
+        - name: ACCESS_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: github-secrets
+              key: access-token
+        - name: RUNNER_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: RUNNER_WORKDIR
+          value: "/tmp/runner/work"
+        - name: RUNNER_GROUP
+          value: "private-runners"
+        - name: LABELS
+          value: "self-hosted,linux,x64,private,secure"
+        - name: DOCKER_HOST
+          value: "tcp://localhost:2376"
+        - name: DOCKER_TLS_VERIFY
+          value: "1"
+        - name: DOCKER_CERT_PATH
+          value: "/certs/client"
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false  # GitHub runner needs write access
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+          requests:
+            cpu: 1000m
+            memory: 2Gi
+        volumeMounts:
+        - name: runner-work
+          mountPath: /tmp/runner/work
+        - name: docker-certs
+          mountPath: /certs/client
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp/runner/tmp
+        livenessProbe:
+          exec:
+            command:
+            - pgrep
+            - Runner.Listener
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          exec:
+            command:
+            - pgrep
+            - Runner.Listener
+          initialDelaySeconds: 10
+          periodSeconds: 10
+
+      # Docker-in-Docker sidecar for GitHub runner
+      - name: docker-dind
+        image: docker:24.0-dind
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: DOCKER_TLS_CERTDIR
+          value: "/certs"
+        - name: DOCKER_DRIVER
+          value: "overlay2"
+        securityContext:
+          privileged: true  # Required for Docker-in-Docker
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+          requests:
+            cpu: 500m
+            memory: 1Gi
+        volumeMounts:
+        - name: docker-certs
+          mountPath: /certs/client
+        - name: docker-storage
+          mountPath: /var/lib/docker
+        - name: tmp
+          mountPath: /tmp
+
+      volumes:
+      - name: runner-work
+        emptyDir:
+          sizeLimit: 10Gi
+      - name: docker-certs
+        emptyDir:
+          sizeLimit: 1Mi
+      - name: docker-storage
+        emptyDir:
+          sizeLimit: 20Gi
+      - name: tmp
+        emptyDir:
+          sizeLimit: 1Gi
+
+---
+# ServiceAccount for GitHub runners
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: github-runner
+  namespace: cicd-agents
+  labels:
+    app: github-actions-runner
+    component: build-agent
+    azure.workload.identity/use: "true"
+  annotations:
+    azure.workload.identity/client-id: "${GITHUB_RUNNER_IDENTITY_CLIENT_ID}"
+
+---
+# Secret for GitHub configuration
+apiVersion: v1
+kind: Secret
+metadata:
+  name: github-secrets
+  namespace: cicd-agents
+  labels:
+    app: github-actions-runner
+    component: build-agent
+type: Opaque
+data:
+  repository-url: "${BASE64_REPOSITORY_URL}"
+  access-token: "${BASE64_GITHUB_TOKEN}"
+
+---
+# NetworkPolicy for CI/CD agents namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cicd-agents-policy
+  namespace: cicd-agents
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow metrics scraping
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  # Allow DNS
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # Allow HTTPS to external services
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+  # Allow HTTP for package downloads
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 80
+  # Allow access to Azure services
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+  # Allow access to ACR
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+  # Allow access to Kubernetes API
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 6443
+
+---
+# HorizontalPodAutoscaler for Azure DevOps agents
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: azure-devops-agent-hpa
+  namespace: cicd-agents
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: azure-devops-agent
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+
+---
+# PodDisruptionBudget for build agents
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: build-agents-pdb
+  namespace: cicd-agents
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      component: build-agent

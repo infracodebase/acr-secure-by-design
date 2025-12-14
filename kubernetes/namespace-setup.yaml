@@ -1,0 +1,246 @@
+# Kubernetes namespace setup with security configurations
+# Production-ready namespaces with proper RBAC and network policies
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    name: production
+    environment: prod
+    security.openshift.io/scc.podSecurityLabelSync: "false"
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+    policy.gatekeeper.sh/mutation: enabled
+  annotations:
+    scheduler.alpha.kubernetes.io/node-selector: "nodepool=user"
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: staging
+  labels:
+    name: staging
+    environment: staging
+    security.openshift.io/scc.podSecurityLabelSync: "false"
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+    policy.gatekeeper.sh/mutation: enabled
+  annotations:
+    scheduler.alpha.kubernetes.io/node-selector: "nodepool=user"
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: development
+  labels:
+    name: development
+    environment: dev
+    security.openshift.io/scc.podSecurityLabelSync: "false"
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+    policy.gatekeeper.sh/mutation: enabled
+  annotations:
+    scheduler.alpha.kubernetes.io/node-selector: "nodepool=user"
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: security-system
+  labels:
+    name: security-system
+    purpose: security
+    security.openshift.io/scc.podSecurityLabelSync: "false"
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: baseline
+    pod-security.kubernetes.io/warn: baseline
+  annotations:
+    scheduler.alpha.kubernetes.io/node-selector: "nodepool=system"
+
+---
+# Service Account for workload identity
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: workload-identity-sa
+  namespace: default
+  labels:
+    azure.workload.identity/use: "true"
+  annotations:
+    azure.workload.identity/client-id: "${WORKLOAD_IDENTITY_CLIENT_ID}"
+
+---
+# Service Account for ACR access in production
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: acr-service-account
+  namespace: production
+  labels:
+    azure.workload.identity/use: "true"
+  annotations:
+    azure.workload.identity/client-id: "${WORKLOAD_IDENTITY_CLIENT_ID}"
+
+---
+# Service Account for ACR access in staging
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: acr-service-account
+  namespace: staging
+  labels:
+    azure.workload.identity/use: "true"
+  annotations:
+    azure.workload.identity/client-id: "${WORKLOAD_IDENTITY_CLIENT_ID}"
+
+---
+# Service Account for ACR access in development
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: acr-service-account
+  namespace: development
+  labels:
+    azure.workload.identity/use: "true"
+  annotations:
+    azure.workload.identity/client-id: "${WORKLOAD_IDENTITY_CLIENT_ID}"
+
+---
+# ClusterRole for reading nodes and pods (for monitoring)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: node-reader
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "nodes/status", "pods"]
+  verbs: ["get", "list", "watch"]
+
+---
+# Role for production namespace management
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: production
+  name: production-developer
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps", "secrets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+
+---
+# Role for staging namespace management
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: staging
+  name: staging-developer
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps", "secrets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+
+---
+# Role for development namespace management
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: development
+  name: development-developer
+rules:
+- apiGroups: [""]
+  resources: ["*"]
+  verbs: ["*"]
+- apiGroups: ["apps"]
+  resources: ["*"]
+  verbs: ["*"]
+- apiGroups: ["extensions"]
+  resources: ["*"]
+  verbs: ["*"]
+
+---
+# RoleBinding for production developers
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: production-developers
+  namespace: production
+subjects:
+- kind: Group
+  name: "${AKS_DEVELOPERS_GROUP_ID}"
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: production-developer
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# RoleBinding for staging developers
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: staging-developers
+  namespace: staging
+subjects:
+- kind: Group
+  name: "${AKS_DEVELOPERS_GROUP_ID}"
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: staging-developer
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# RoleBinding for development developers
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: development-developers
+  namespace: development
+subjects:
+- kind: Group
+  name: "${AKS_DEVELOPERS_GROUP_ID}"
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: development-developer
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ClusterRoleBinding for operators to read cluster resources
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: operators-node-readers
+subjects:
+- kind: Group
+  name: "${AKS_OPERATORS_GROUP_ID}"
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: node-reader
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,50 @@
+{
+	"results": [
+		{
+			"rule_id": "AVD-AZU-0014",
+			"long_id": "azure-keyvault-ensure-key-expiry",
+			"rule_description": "Ensure that the expiration date is set on all keys",
+			"rule_provider": "azure",
+			"rule_service": "keyvault",
+			"impact": "Long life keys increase the attack surface when compromised",
+			"resolution": "Set an expiration date on the vault key",
+			"links": [
+				"https://aquasecurity.github.io/tfsec/latest/checks/azure/keyvault/ensure-key-expiry/",
+				"https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/key_vault_key#expiration_date"
+			],
+			"description": "Key should have an expiry date specified.",
+			"severity": "MEDIUM",
+			"warning": false,
+			"status": 0,
+			"resource": "module.management",
+			"location": {
+				"filename": "/tmp/workspaces/4ae5bd67-feea-4ee6-99f6-21fb47b3e8bd/code/terraform/modules/management/main.tf",
+				"start_line": 227,
+				"end_line": 243
+			}
+		},
+		{
+			"rule_id": "AVD-AZU-0014",
+			"long_id": "azure-keyvault-ensure-key-expiry",
+			"rule_description": "Ensure that the expiration date is set on all keys",
+			"rule_provider": "azure",
+			"rule_service": "keyvault",
+			"impact": "Long life keys increase the attack surface when compromised",
+			"resolution": "Set an expiration date on the vault key",
+			"links": [
+				"https://aquasecurity.github.io/tfsec/latest/checks/azure/keyvault/ensure-key-expiry/",
+				"https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/key_vault_key#expiration_date"
+			],
+			"description": "Key should have an expiry date specified.",
+			"severity": "MEDIUM",
+			"warning": false,
+			"status": 0,
+			"resource": "module.management",
+			"location": {
+				"filename": "/tmp/workspaces/4ae5bd67-feea-4ee6-99f6-21fb47b3e8bd/code/terraform/modules/management/main.tf",
+				"start_line": 204,
+				"end_line": 224
+			}
+		}
+	]
+}

@@ -1,0 +1,210 @@
+# Kyverno Installation and Configuration
+# Enterprise-grade policy management and admission control
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kyverno
+  labels:
+    name: kyverno
+    purpose: policy-management
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+
+---
+# Kyverno configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kyverno-config
+  namespace: kyverno
+  labels:
+    app: kyverno
+    component: config
+data:
+  config.yaml: |
+    # Kyverno configuration
+    resourceFilters:
+    - "[Event,*,*]"
+    - "[*,kube-system,*]"
+    - "[*,kube-public,*]"
+    - "[*,kyverno,*]"
+    - "[NodeMetrics,*,*]"
+    - "[PodMetrics,*,*]"
+    - "[ServiceMonitor,*,*]"
+    - "[PrometheusRule,*,*]"
+
+    webhookTimeout: 30
+    generateSuccessEvents: false
+    enableReports: true
+
+    # Background scanning configuration
+    backgroundScan: true
+    backgroundScanInterval: "24h"
+    backgroundScanWorkers: 5
+
+    # Metrics configuration
+    metricsConfig:
+      includeClusterRoles: false
+      enableAggregation: true
+
+---
+# Kyverno Helm values for installation
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kyverno-values
+  namespace: kyverno
+  labels:
+    app: kyverno
+    component: helm-values
+data:
+  values.yaml: |
+    replicaCount: 3
+
+    image:
+      registry: ghcr.io
+      repository: kyverno/kyverno
+      tag: v1.10.5
+      pullPolicy: IfNotPresent
+
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      fsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
+
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+        - ALL
+
+    resources:
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+      requests:
+        cpu: 500m
+        memory: 512Mi
+
+    # High availability configuration
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+            - key: app.kubernetes.io/name
+              operator: In
+              values:
+              - kyverno
+          topologyKey: kubernetes.io/hostname
+
+    # Webhook configuration
+    webhookAnnotations:
+      admissions.enforcer/disabled: "false"
+
+    # Service Monitor for Prometheus
+    serviceMonitor:
+      enabled: true
+      interval: 30s
+      scrapeTimeout: 25s
+
+    # Network policy
+    networkPolicy:
+      enabled: true
+
+    # Pod disruption budget
+    podDisruptionBudget:
+      enabled: true
+      minAvailable: 2
+
+---
+# ClusterRole for Kyverno
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kyverno-policies-reader
+  labels:
+    app: kyverno
+    component: policies
+rules:
+- apiGroups: ["kyverno.io"]
+  resources: ["policies", "clusterpolicies", "policyreports", "clusterpolicyreports"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create"]
+
+---
+# ServiceAccount for policy management
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: policy-manager
+  namespace: kyverno
+  labels:
+    app: kyverno
+    component: policy-manager
+automountServiceAccountToken: false
+
+---
+# ClusterRoleBinding for policy management
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: policy-manager
+  labels:
+    app: kyverno
+    component: policy-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kyverno-policies-reader
+subjects:
+- kind: ServiceAccount
+  name: policy-manager
+  namespace: kyverno
+
+---
+# NetworkPolicy for Kyverno namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kyverno-network-policy
+  namespace: kyverno
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow webhook traffic from API server
+  - from: []
+    ports:
+    - protocol: TCP
+      port: 9443
+  # Allow metrics scraping
+  - from: []
+    ports:
+    - protocol: TCP
+      port: 8000
+  egress:
+  # Allow DNS
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # Allow API server access
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 6443

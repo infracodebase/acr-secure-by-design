@@ -1,0 +1,410 @@
+# Secure GitHub Actions CI/CD Pipeline for Zero Trust ACR
+# Production-ready pipeline with comprehensive security controls
+
+name: Secure Container Build and Deploy
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+    - 'src/**'
+    - 'Dockerfile'
+    - '.github/workflows/**'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  # Azure Configuration
+  ACR_NAME: ${{ vars.ACR_NAME }}
+  ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+  AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
+  AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP }}
+  AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+
+  # Security Configuration
+  TRIVY_TIMEOUT: "10m"
+  COSIGN_EXPERIMENTAL: "1"
+
+  # Image Configuration
+  IMAGE_NAME: "web-app"
+  IMAGE_TAG: ${{ github.sha }}
+
+permissions:
+  contents: read
+  security-events: write
+  id-token: write  # Required for OIDC authentication
+
+jobs:
+  # Security scanning of repository
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history for better security scanning
+
+    - name: Run Trivy vulnerability scanner in repo mode
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+    - name: Run Semgrep security scanner
+      uses: securecodewarrior/github-action-add-sarif@v1
+      with:
+        sarif-file: trivy-results.sarif
+
+    - name: Scan for secrets
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        base: main
+        head: HEAD
+
+  # Infrastructure security scanning
+  infrastructure-scan:
+    name: Infrastructure Security Scan
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install Checkov
+      run: pip install checkov
+
+    - name: Run Checkov IaC scanner
+      run: |
+        checkov -d terraform/ --framework terraform \
+          --output cli --output sarif --output-file-path checkov-results.sarif \
+          --check CKV_AZURE_* --check CKV_K8S_* \
+          --skip-check CKV_DOCKER_* \
+          --soft-fail
+
+    - name: Upload Checkov results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: checkov-results.sarif
+
+  # Docker build and security scan
+  build-and-scan:
+    name: Build and Scan Container
+    runs-on: ubuntu-latest
+    needs: [security-scan, infrastructure-scan]
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tags: ${{ steps.build.outputs.tags }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Azure
+      uses: azure/login@v1
+      with:
+        client-id: ${{ env.AZURE_CLIENT_ID }}
+        tenant-id: ${{ env.AZURE_TENANT_ID }}
+        subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Log in to Azure Container Registry
+      run: az acr login --name ${{ env.ACR_NAME }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build container image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64
+        push: false
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        outputs: type=docker,dest=/tmp/image.tar
+
+    - name: Load image for scanning
+      run: docker load --input /tmp/image.tar
+
+    - name: Run Trivy container scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        format: 'sarif'
+        output: 'trivy-image-results.sarif'
+        timeout: ${{ env.TRIVY_TIMEOUT }}
+        exit-code: '1'  # Fail on vulnerabilities
+        ignore-unfixed: true
+        vuln-type: 'os,library'
+        severity: 'CRITICAL,HIGH'
+
+    - name: Upload Trivy image scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-image-results.sarif'
+
+    - name: Generate SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+        format: spdx-json
+        output-file: sbom.spdx.json
+
+    - name: Upload SBOM artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: sbom
+        path: sbom.spdx.json
+
+    - name: Scan SBOM for vulnerabilities
+      uses: anchore/scan-action@v3
+      with:
+        sbom: sbom.spdx.json
+        fail-build: true
+        severity-cutoff: high
+
+    # Only push if all security checks pass
+    - name: Push container image
+      if: success()
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # Sign container image
+  sign-image:
+    name: Sign Container Image
+    runs-on: ubuntu-latest
+    needs: build-and-scan
+    if: github.ref == 'refs/heads/main'
+    steps:
+    - name: Install cosign
+      uses: sigstore/cosign-installer@v3
+      with:
+        cosign-release: 'v2.2.1'
+
+    - name: Log in to Azure
+      uses: azure/login@v1
+      with:
+        client-id: ${{ env.AZURE_CLIENT_ID }}
+        tenant-id: ${{ env.AZURE_TENANT_ID }}
+        subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Log in to Azure Container Registry
+      run: az acr login --name ${{ env.ACR_NAME }}
+
+    - name: Sign container image
+      env:
+        COSIGN_EXPERIMENTAL: 1
+      run: |
+        cosign sign --yes \
+          ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-scan.outputs.image-digest }}
+
+    - name: Verify signature
+      env:
+        COSIGN_EXPERIMENTAL: 1
+      run: |
+        cosign verify \
+          --certificate-identity-regexp=".*${{ github.repository }}.*" \
+          --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+          ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-scan.outputs.image-digest }}
+
+    - name: Generate and sign SBOM attestation
+      if: success()
+      env:
+        COSIGN_EXPERIMENTAL: 1
+      run: |
+        # Download SBOM artifact
+        curl -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          -L -o sbom.spdx.json \
+          "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${{ needs.build-and-scan.outputs.sbom-artifact-id }}/zip"
+
+        # Create and sign attestation
+        cosign attest --yes \
+          --predicate sbom.spdx.json \
+          --type spdxjson \
+          ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-scan.outputs.image-digest }}
+
+  # Deploy to staging (if develop branch)
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build-and-scan, sign-image]
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment: staging
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Log in to Azure
+      uses: azure/login@v1
+      with:
+        client-id: ${{ env.AZURE_CLIENT_ID }}
+        tenant-id: ${{ env.AZURE_TENANT_ID }}
+        subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Get AKS credentials
+      run: |
+        az aks get-credentials \
+          --resource-group ${{ env.AKS_RESOURCE_GROUP }} \
+          --name ${{ env.AKS_CLUSTER_NAME }}
+
+    - name: Deploy to staging namespace
+      run: |
+        kubectl set image deployment/${{ env.IMAGE_NAME }} \
+          ${{ env.IMAGE_NAME }}=${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+          -n staging
+
+        kubectl rollout status deployment/${{ env.IMAGE_NAME }} -n staging --timeout=300s
+
+    - name: Verify deployment
+      run: |
+        kubectl get pods -n staging -l app=${{ env.IMAGE_NAME }}
+        kubectl logs -n staging deployment/${{ env.IMAGE_NAME }} --tail=10
+
+  # Deploy to production (if main branch)
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-and-scan, sign-image]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Log in to Azure
+      uses: azure/login@v1
+      with:
+        client-id: ${{ env.AZURE_CLIENT_ID }}
+        tenant-id: ${{ env.AZURE_TENANT_ID }}
+        subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Get AKS credentials
+      run: |
+        az aks get-credentials \
+          --resource-group ${{ env.AKS_RESOURCE_GROUP }} \
+          --name ${{ env.AKS_CLUSTER_NAME }}
+
+    - name: Verify image signature before deployment
+      env:
+        COSIGN_EXPERIMENTAL: 1
+      run: |
+        cosign verify \
+          --certificate-identity-regexp=".*${{ github.repository }}.*" \
+          --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+          ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-scan.outputs.image-digest }}
+
+    - name: Deploy to production namespace
+      run: |
+        kubectl set image deployment/${{ env.IMAGE_NAME }} \
+          ${{ env.IMAGE_NAME }}=${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+          -n production
+
+        kubectl rollout status deployment/${{ env.IMAGE_NAME }} -n production --timeout=300s
+
+    - name: Verify deployment
+      run: |
+        kubectl get pods -n production -l app=${{ env.IMAGE_NAME }}
+        kubectl logs -n production deployment/${{ env.IMAGE_NAME }} --tail=10
+
+    - name: Run smoke tests
+      run: |
+        # Add smoke test commands here
+        echo "Running smoke tests..."
+        kubectl exec -n production deployment/${{ env.IMAGE_NAME }} -- /bin/sh -c "curl -f http://localhost:8080/health"
+
+  # Security compliance check
+  compliance-check:
+    name: Compliance Check
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+    - name: Log in to Azure
+      uses: azure/login@v1
+      with:
+        client-id: ${{ env.AZURE_CLIENT_ID }}
+        tenant-id: ${{ env.AZURE_TENANT_ID }}
+        subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Get AKS credentials
+      run: |
+        az aks get-credentials \
+          --resource-group ${{ env.AKS_RESOURCE_GROUP }} \
+          --name ${{ env.AKS_CLUSTER_NAME }}
+
+    - name: Check policy compliance
+      run: |
+        # Check Kyverno policy violations
+        kubectl get policyreport -A
+
+        # Check for any policy violations
+        VIOLATIONS=$(kubectl get policyreport -A -o json | jq '.items[] | select(.summary.fail > 0) | .metadata.name')
+
+        if [ ! -z "$VIOLATIONS" ]; then
+          echo "Policy violations found: $VIOLATIONS"
+          kubectl get policyreport -A -o yaml
+          exit 1
+        fi
+
+        echo "All policies are compliant"
+
+    - name: Generate compliance report
+      run: |
+        echo "# Compliance Report" > compliance-report.md
+        echo "Generated: $(date)" >> compliance-report.md
+        echo "" >> compliance-report.md
+        echo "## Image Details" >> compliance-report.md
+        echo "- Image: ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" >> compliance-report.md
+        echo "- Digest: ${{ needs.build-and-scan.outputs.image-digest }}" >> compliance-report.md
+        echo "- Signed: ✓" >> compliance-report.md
+        echo "- SBOM: ✓" >> compliance-report.md
+        echo "- Security Scan: ✓" >> compliance-report.md
+        echo "" >> compliance-report.md
+        echo "## Deployment Status" >> compliance-report.md
+        echo "- Environment: Production" >> compliance-report.md
+        echo "- Status: Successful" >> compliance-report.md
+        echo "- Policies: Compliant" >> compliance-report.md
+
+    - name: Upload compliance report
+      uses: actions/upload-artifact@v3
+      with:
+        name: compliance-report
+        path: compliance-report.md

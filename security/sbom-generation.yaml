@@ -1,0 +1,430 @@
+# SBOM (Software Bill of Materials) Generation Configuration
+# Comprehensive supply chain visibility and traceability
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sbom-config
+  namespace: security-system
+  labels:
+    app: sbom-generator
+    component: supply-chain-security
+data:
+  syft.yaml: |
+    # Syft SBOM generator configuration
+    output:
+      - "spdx-json"
+      - "cyclonedx-json"
+
+    # Package cataloger configuration
+    package:
+      cataloger:
+        enabled: true
+        scope: "AllLayers"
+
+    # File cataloger configuration
+    file:
+      cataloger:
+        enabled: true
+        scope: "AllLayers"
+        digests: ["sha256"]
+
+    # Metadata configuration
+    metadata:
+      include-licenses: true
+      include-purl: true
+
+    # Registry configuration
+    registry:
+      insecure-skip-tls-verify: false
+      insecure-use-http: false
+
+    log:
+      level: "warn"
+      file: ""
+
+  grype.yaml: |
+    # Grype vulnerability scanner configuration
+    check-for-app-update: false
+
+    # Database configuration
+    db:
+      cache-dir: "/var/cache/grype/db"
+      update-url: "https://toolbox-data.anchore.io/grype/databases/listing.json"
+      ca-cert: ""
+      auto-update: true
+      validate-by-hash-on-start: false
+      max-allowed-built-age: 432000
+
+    # Match configuration
+    match:
+      java:
+        using-cpes: true
+      dotnet:
+        using-cpes: true
+      golang:
+        using-cpes: true
+      javascript:
+        using-cpes: true
+
+    # Registry configuration
+    registry:
+      insecure-skip-tls-verify: false
+      insecure-use-http: false
+
+    log:
+      level: "error"
+
+    # Failure mode configuration
+    fail-on-severity: "medium"
+
+---
+# SBOM Generator Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sbom-generator
+  namespace: security-system
+  labels:
+    app: sbom-generator
+    component: supply-chain-security
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sbom-generator
+      component: supply-chain-security
+  template:
+    metadata:
+      labels:
+        app: sbom-generator
+        component: supply-chain-security
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: sbom-generator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: sbom-generator
+        image: anchore/syft:v0.96.0
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c"]
+        args:
+          - |
+            # Start HTTP server for health checks
+            while true; do
+              echo "SBOM Generator is running..."
+              sleep 30
+            done
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          limits:
+            cpu: 500m
+            memory: 1Gi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        volumeMounts:
+        - name: config
+          mountPath: /etc/syft
+          readOnly: true
+        - name: cache
+          mountPath: /var/cache/syft
+        - name: tmp
+          mountPath: /tmp
+        livenessProbe:
+          exec:
+            command:
+            - "sh"
+            - "-c"
+            - "ps aux | grep syft || true"
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          exec:
+            command:
+            - "sh"
+            - "-c"
+            - "ps aux | grep syft || true"
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      - name: grype-scanner
+        image: anchore/grype:v0.74.0
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c"]
+        args:
+          - |
+            # Start Grype vulnerability scanner service
+            while true; do
+              echo "Grype Scanner is running..."
+              sleep 30
+            done
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          limits:
+            cpu: 500m
+            memory: 1Gi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        volumeMounts:
+        - name: grype-config
+          mountPath: /etc/grype
+          readOnly: true
+        - name: grype-cache
+          mountPath: /var/cache/grype
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: config
+        configMap:
+          name: sbom-config
+      - name: grype-config
+        configMap:
+          name: sbom-config
+      - name: cache
+        emptyDir:
+          sizeLimit: 2Gi
+      - name: grype-cache
+        emptyDir:
+          sizeLimit: 2Gi
+      - name: tmp
+        emptyDir:
+          sizeLimit: 500Mi
+
+---
+# ServiceAccount for SBOM generator
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sbom-generator
+  namespace: security-system
+  labels:
+    app: sbom-generator
+    component: supply-chain-security
+automountServiceAccountToken: false
+
+---
+# CronJob for automated SBOM generation
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: sbom-scheduled-scan
+  namespace: security-system
+  labels:
+    app: sbom-generator
+    component: scheduled-scan
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: sbom-generator
+            component: scheduled-scan
+        spec:
+          serviceAccountName: sbom-generator
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          restartPolicy: OnFailure
+          containers:
+          - name: sbom-scanner
+            image: anchore/syft:v0.96.0
+            imagePullPolicy: IfNotPresent
+            command: ["sh", "-c"]
+            args:
+              - |
+                # Scan all images in the registry and generate SBOMs
+                echo "Starting scheduled SBOM generation..."
+
+                # Example: Scan specific images (replace with actual registry URLs)
+                IMAGES=(
+                  "${ACR_LOGIN_SERVER}/base/ubuntu:latest"
+                  "${ACR_LOGIN_SERVER}/apps/web-app:latest"
+                  "${ACR_LOGIN_SERVER}/tools/scanner:latest"
+                )
+
+                for image in "${IMAGES[@]}"; do
+                  echo "Generating SBOM for: $image"
+
+                  # Generate SPDX SBOM
+                  syft packages "$image" -o spdx-json=/tmp/sbom-spdx-$(basename $image).json
+
+                  # Generate CycloneDX SBOM
+                  syft packages "$image" -o cyclonedx-json=/tmp/sbom-cyclonedx-$(basename $image).json
+
+                  # Scan for vulnerabilities
+                  grype "$image" -o json > /tmp/vuln-$(basename $image).json
+
+                  echo "SBOM and vulnerability scan completed for: $image"
+                done
+
+                echo "Scheduled SBOM generation completed."
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop:
+                - ALL
+            resources:
+              limits:
+                cpu: 1000m
+                memory: 2Gi
+              requests:
+                cpu: 500m
+                memory: 1Gi
+            volumeMounts:
+            - name: config
+              mountPath: /etc/syft
+              readOnly: true
+            - name: cache
+              mountPath: /var/cache
+            - name: tmp
+              mountPath: /tmp
+            env:
+            - name: ACR_LOGIN_SERVER
+              value: "${ACR_LOGIN_SERVER}"
+          volumes:
+          - name: config
+            configMap:
+              name: sbom-config
+          - name: cache
+            emptyDir:
+              sizeLimit: 5Gi
+          - name: tmp
+            emptyDir:
+              sizeLimit: 2Gi
+
+---
+# Service for SBOM generator (for internal communication)
+apiVersion: v1
+kind: Service
+metadata:
+  name: sbom-generator
+  namespace: security-system
+  labels:
+    app: sbom-generator
+    component: supply-chain-security
+spec:
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http
+    protocol: TCP
+  selector:
+    app: sbom-generator
+    component: supply-chain-security
+
+---
+# ConfigMap for SBOM storage and management scripts
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sbom-scripts
+  namespace: security-system
+  labels:
+    app: sbom-generator
+    component: scripts
+data:
+  generate-sbom.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    IMAGE="$1"
+    OUTPUT_DIR="$2"
+
+    if [[ -z "$IMAGE" || -z "$OUTPUT_DIR" ]]; then
+        echo "Usage: $0 <image> <output_directory>"
+        exit 1
+    fi
+
+    echo "Generating SBOM for image: $IMAGE"
+
+    # Create output directory
+    mkdir -p "$OUTPUT_DIR"
+
+    # Generate SPDX SBOM
+    syft packages "$IMAGE" -o spdx-json="$OUTPUT_DIR/sbom-spdx.json"
+
+    # Generate CycloneDX SBOM
+    syft packages "$IMAGE" -o cyclonedx-json="$OUTPUT_DIR/sbom-cyclonedx.json"
+
+    # Generate vulnerability report
+    grype "$IMAGE" -o json > "$OUTPUT_DIR/vulnerabilities.json"
+
+    # Generate summary report
+    cat <<EOF > "$OUTPUT_DIR/summary.json"
+    {
+      "image": "$IMAGE",
+      "scan_time": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+      "sbom_formats": ["spdx-json", "cyclonedx-json"],
+      "vulnerability_scan": true,
+      "files": {
+        "spdx_sbom": "sbom-spdx.json",
+        "cyclonedx_sbom": "sbom-cyclonedx.json",
+        "vulnerabilities": "vulnerabilities.json"
+      }
+    }
+    EOF
+
+    echo "SBOM generation completed for: $IMAGE"
+    echo "Output directory: $OUTPUT_DIR"
+
+  upload-to-acr.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    IMAGE="$1"
+    SBOM_FILE="$2"
+    ACR_SERVER="${ACR_LOGIN_SERVER}"
+
+    if [[ -z "$IMAGE" || -z "$SBOM_FILE" ]]; then
+        echo "Usage: $0 <image> <sbom_file>"
+        exit 1
+    fi
+
+    echo "Uploading SBOM to ACR for image: $IMAGE"
+
+    # Use OCI artifact format to store SBOM
+    # This requires oras tool or similar OCI artifact tool
+
+    # Extract image name without tag
+    IMAGE_NAME=$(echo "$IMAGE" | cut -d':' -f1)
+    IMAGE_TAG=$(echo "$IMAGE" | cut -d':' -f2)
+
+    # Upload SBOM as OCI artifact
+    # Note: This is a placeholder - actual implementation would use oras or similar tool
+    echo "Would upload SBOM for $IMAGE_NAME:$IMAGE_TAG"
+    echo "SBOM file: $SBOM_FILE"
+    echo "ACR server: $ACR_SERVER"

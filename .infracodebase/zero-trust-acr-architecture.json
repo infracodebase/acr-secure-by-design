@@ -1,0 +1,210 @@
+{
+  "nodes": [
+    {
+      "id": "hub-vnet",
+      "label": "Virtual Network",
+      "subtitle": "Hub VNet (10.0.0.0/16)",
+      "icon": "/icons/azure/networking/virtual-network.png"
+    },
+    {
+      "id": "aks-vnet",
+      "label": "Virtual Network",
+      "subtitle": "AKS Spoke (10.1.0.0/16)",
+      "icon": "/icons/azure/networking/virtual-network.png"
+    },
+    {
+      "id": "cicd-vnet",
+      "label": "Virtual Network",
+      "subtitle": "CI/CD Spoke (10.2.0.0/16)",
+      "icon": "/icons/azure/networking/virtual-network.png"
+    },
+    {
+      "id": "azure-firewall",
+      "label": "Azure Firewall",
+      "subtitle": "Network Security",
+      "icon": "/icons/azure/security/azure-firewall.png"
+    },
+    {
+      "id": "bastion",
+      "label": "Azure Bastion",
+      "subtitle": "Secure Remote Access",
+      "icon": "/icons/azure/networking/bastion.png"
+    },
+    {
+      "id": "acr",
+      "label": "Container Registry",
+      "subtitle": "Premium ACR (Private)",
+      "icon": "/icons/azure/compute/container-registry.png"
+    },
+    {
+      "id": "aks-cluster",
+      "label": "Kubernetes Service",
+      "subtitle": "Private AKS Cluster",
+      "icon": "/icons/azure/compute/container-kubernetes-service.png"
+    },
+    {
+      "id": "key-vault",
+      "label": "Key Vault",
+      "subtitle": "Premium KV (Private)",
+      "icon": "/icons/azure/security/key-vault.png"
+    },
+    {
+      "id": "log-analytics",
+      "label": "Log Analytics",
+      "subtitle": "Centralized Logging",
+      "icon": "/icons/azure/management/log-analytics-solution.png"
+    },
+    {
+      "id": "acr-private-endpoint",
+      "label": "Private Endpoint",
+      "subtitle": "ACR Private Link",
+      "icon": "/icons/azure/networking/private-endpoint.png"
+    },
+    {
+      "id": "kv-private-endpoint",
+      "label": "Private Endpoint",
+      "subtitle": "Key Vault Private Link",
+      "icon": "/icons/azure/networking/private-endpoint.png"
+    },
+    {
+      "id": "azure-ad",
+      "label": "Azure Active Directory",
+      "subtitle": "Identity & Access",
+      "icon": "/icons/azure/workload/azure-active-directory-sync-primary.png"
+    },
+    {
+      "id": "system-node-pool",
+      "label": "System Node Pool",
+      "subtitle": "AKS System Nodes",
+      "icon": "/icons/azure/compute/virtual-machine-scale-set.png"
+    },
+    {
+      "id": "user-node-pool",
+      "label": "User Node Pool",
+      "subtitle": "Application Nodes",
+      "icon": "/icons/azure/compute/virtual-machine-scale-set.png"
+    },
+    {
+      "id": "build-agents",
+      "label": "Build Agents",
+      "subtitle": "Private CI/CD Agents",
+      "icon": "/icons/azure/compute/container-registry.png"
+    }
+  ],
+  "edges": [
+    {
+      "id": "hub-aks-peering",
+      "source": "hub-vnet",
+      "target": "aks-vnet",
+      "label": "VNet Peering"
+    },
+    {
+      "id": "hub-cicd-peering",
+      "source": "hub-vnet",
+      "target": "cicd-vnet",
+      "label": "VNet Peering"
+    },
+    {
+      "id": "firewall-in-hub",
+      "source": "hub-vnet",
+      "target": "azure-firewall",
+      "label": "contains"
+    },
+    {
+      "id": "bastion-in-hub",
+      "source": "hub-vnet",
+      "target": "bastion",
+      "label": "contains"
+    },
+    {
+      "id": "acr-pe-in-hub",
+      "source": "hub-vnet",
+      "target": "acr-private-endpoint",
+      "label": "contains"
+    },
+    {
+      "id": "kv-pe-in-hub",
+      "source": "hub-vnet",
+      "target": "kv-private-endpoint",
+      "label": "contains"
+    },
+    {
+      "id": "aks-cluster-in-aks-vnet",
+      "source": "aks-vnet",
+      "target": "aks-cluster",
+      "label": "contains"
+    },
+    {
+      "id": "system-pool-in-aks",
+      "source": "aks-cluster",
+      "target": "system-node-pool",
+      "label": "contains"
+    },
+    {
+      "id": "user-pool-in-aks",
+      "source": "aks-cluster",
+      "target": "user-node-pool",
+      "label": "contains"
+    },
+    {
+      "id": "build-agents-in-cicd",
+      "source": "cicd-vnet",
+      "target": "build-agents",
+      "label": "contains"
+    },
+    {
+      "id": "acr-pe-to-acr",
+      "source": "acr-private-endpoint",
+      "target": "acr",
+      "label": "private link"
+    },
+    {
+      "id": "kv-pe-to-kv",
+      "source": "kv-private-endpoint",
+      "target": "key-vault",
+      "label": "private link"
+    },
+    {
+      "id": "aks-pulls-from-acr",
+      "source": "aks-cluster",
+      "target": "acr-private-endpoint",
+      "label": "pulls images"
+    },
+    {
+      "id": "aks-accesses-kv",
+      "source": "aks-cluster",
+      "target": "kv-private-endpoint",
+      "label": "accesses secrets"
+    },
+    {
+      "id": "aks-logs-to-la",
+      "source": "aks-cluster",
+      "target": "log-analytics",
+      "label": "sends logs"
+    },
+    {
+      "id": "acr-logs-to-la",
+      "source": "acr",
+      "target": "log-analytics",
+      "label": "audit logs"
+    },
+    {
+      "id": "build-agents-push-to-acr",
+      "source": "build-agents",
+      "target": "acr-private-endpoint",
+      "label": "pushes images"
+    },
+    {
+      "id": "azure-ad-authenticates-aks",
+      "source": "azure-ad",
+      "target": "aks-cluster",
+      "label": "authenticates"
+    },
+    {
+      "id": "azure-ad-protects-acr",
+      "source": "azure-ad",
+      "target": "acr",
+      "label": "RBAC control"
+    }
+  ]
+}

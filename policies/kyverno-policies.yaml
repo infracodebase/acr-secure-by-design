@@ -1,0 +1,499 @@
+# Kyverno Policies for Zero Trust Container Registry
+# Comprehensive admission control and security policies
+
+# Policy: Require images from trusted ACR only
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-trusted-registry
+  labels:
+    app: kyverno
+    policy-type: security
+    severity: high
+  annotations:
+    policies.kyverno.io/title: "Require Trusted Container Registry"
+    policies.kyverno.io/category: "Supply Chain Security"
+    policies.kyverno.io/severity: "high"
+    policies.kyverno.io/subject: "Pod"
+    policies.kyverno.io/description: >-
+      Ensures that all container images are pulled from the trusted Azure Container Registry.
+      This policy prevents the use of external or untrusted registries in production environments.
+spec:
+  validationFailureAction: enforce
+  background: true
+  rules:
+  - name: check-registry
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - production
+          - staging
+    validate:
+      message: "Images must be from trusted ACR registry: {{ACR_LOGIN_SERVER}}"
+      pattern:
+        spec:
+          containers:
+          - image: "{{ACR_LOGIN_SERVER}}/*"
+  - name: check-init-containers
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - production
+          - staging
+    validate:
+      message: "Init container images must be from trusted ACR registry: {{ACR_LOGIN_SERVER}}"
+      pattern:
+        spec:
+          =(initContainers):
+          - image: "{{ACR_LOGIN_SERVER}}/*"
+
+---
+# Policy: Require signed images
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-signed-images
+  labels:
+    app: kyverno
+    policy-type: security
+    severity: critical
+  annotations:
+    policies.kyverno.io/title: "Require Signed Container Images"
+    policies.kyverno.io/category: "Supply Chain Security"
+    policies.kyverno.io/severity: "critical"
+    policies.kyverno.io/subject: "Pod"
+    policies.kyverno.io/description: >-
+      Ensures that all container images in production are cryptographically signed.
+      This policy verifies image signatures using cosign or notation.
+spec:
+  validationFailureAction: enforce
+  background: false
+  rules:
+  - name: verify-signature
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - production
+    verifyImages:
+    - imageReferences:
+      - "{{ACR_LOGIN_SERVER}}/prod/*"
+      attestors:
+      - keyless:
+          subject: "https://github.com/{{GITHUB_ORG}}/{{GITHUB_REPO}}/.github/workflows/release.yml@refs/heads/main"
+          issuer: "https://token.actions.githubusercontent.com"
+          rekor:
+            url: "https://rekor.sigstore.dev"
+
+---
+# Policy: Disallow latest tag
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+  labels:
+    app: kyverno
+    policy-type: best-practices
+    severity: medium
+  annotations:
+    policies.kyverno.io/title: "Disallow Latest Tag"
+    policies.kyverno.io/category: "Best Practices"
+    policies.kyverno.io/severity: "medium"
+    policies.kyverno.io/subject: "Pod"
+    policies.kyverno.io/description: >-
+      Prevents the use of 'latest' tag in container images to ensure
+      reproducible deployments and proper version tracking.
+spec:
+  validationFailureAction: enforce
+  background: true
+  rules:
+  - name: require-image-tag
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - production
+          - staging
+    validate:
+      message: "Using 'latest' tag is not allowed in production environments"
+      pattern:
+        spec:
+          containers:
+          - image: "!*:latest"
+  - name: require-init-image-tag
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - production
+          - staging
+    validate:
+      message: "Using 'latest' tag is not allowed in init containers"
+      pattern:
+        spec:
+          =(initContainers):
+          - image: "!*:latest"
+
+---
+# Policy: Require resource limits
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-pod-resources
+  labels:
+    app: kyverno
+    policy-type: resource-management
+    severity: medium
+  annotations:
+    policies.kyverno.io/title: "Require Pod Resource Limits"
+    policies.kyverno.io/category: "Resource Management"
+    policies.kyverno.io/severity: "medium"
+    policies.kyverno.io/subject: "Pod"
+    policies.kyverno.io/description: >-
+      Ensures that all pods have CPU and memory resource limits defined
+      to prevent resource exhaustion and improve cluster stability.
+spec:
+  validationFailureAction: enforce
+  background: true
+  rules:
+  - name: validate-resources
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+    exclude:
+      any:
+      - resources:
+          namespaces:
+          - kube-system
+          - kyverno
+          - notary-system
+    validate:
+      message: "Resource requests and limits are required"
+      pattern:
+        spec:
+          containers:
+          - name: "*"
+            resources:
+              requests:
+                memory: "?*"
+                cpu: "?*"
+              limits:
+                memory: "?*"
+                cpu: "?*"
+
+---
+# Policy: Disallow privileged containers
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-privileged-containers
+  labels:
+    app: kyverno
+    policy-type: security
+    severity: high
+  annotations:
+    policies.kyverno.io/title: "Disallow Privileged Containers"
+    policies.kyverno.io/category: "Pod Security Standards (Restricted)"
+    policies.kyverno.io/severity: "high"
+    policies.kyverno.io/subject: "Pod"
+    policies.kyverno.io/description: >-
+      Prevents the creation of privileged containers which have access to
+      host resources and can compromise cluster security.
+spec:
+  validationFailureAction: enforce
+  background: true
+  rules:
+  - name: check-privileged
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+    exclude:
+      any:
+      - resources:
+          namespaces:
+          - kube-system
+    validate:
+      message: "Privileged containers are not allowed"
+      pattern:
+        spec:
+          =(securityContext):
+            =(privileged): "false"
+          containers:
+          - =(securityContext):
+              =(privileged): "false"
+
+---
+# Policy: Require non-root containers
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-non-root
+  labels:
+    app: kyverno
+    policy-type: security
+    severity: high
+  annotations:
+    policies.kyverno.io/title: "Require Non-Root Containers"
+    policies.kyverno.io/category: "Pod Security Standards (Restricted)"
+    policies.kyverno.io/severity: "high"
+    policies.kyverno.io/subject: "Pod"
+    policies.kyverno.io/description: >-
+      Ensures that containers run as non-root users to reduce the attack
+      surface and follow security best practices.
+spec:
+  validationFailureAction: enforce
+  background: true
+  rules:
+  - name: check-runasnonroot
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+    exclude:
+      any:
+      - resources:
+          namespaces:
+          - kube-system
+          - kyverno
+    validate:
+      message: "Containers must run as non-root user"
+      anyPattern:
+      - spec:
+          securityContext:
+            runAsNonRoot: true
+      - spec:
+          containers:
+          - securityContext:
+              runAsNonRoot: true
+
+---
+# Policy: Disallow host network and ports
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-host-network-port
+  labels:
+    app: kyverno
+    policy-type: security
+    severity: high
+  annotations:
+    policies.kyverno.io/title: "Disallow Host Network and Ports"
+    policies.kyverno.io/category: "Pod Security Standards (Baseline)"
+    policies.kyverno.io/severity: "high"
+    policies.kyverno.io/subject: "Pod"
+    policies.kyverno.io/description: >-
+      Prevents pods from using host networking which could allow access
+      to host network services and compromise cluster isolation.
+spec:
+  validationFailureAction: enforce
+  background: true
+  rules:
+  - name: check-hostnetwork
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+    exclude:
+      any:
+      - resources:
+          namespaces:
+          - kube-system
+    validate:
+      message: "Using host network is not allowed"
+      pattern:
+        spec:
+          =(hostNetwork): "false"
+          =(hostPID): "false"
+          =(hostIPC): "false"
+
+---
+# Policy: Require security context
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-security-context
+  labels:
+    app: kyverno
+    policy-type: security
+    severity: medium
+  annotations:
+    policies.kyverno.io/title: "Require Security Context"
+    policies.kyverno.io/category: "Pod Security Standards (Restricted)"
+    policies.kyverno.io/severity: "medium"
+    policies.kyverno.io/subject: "Pod"
+    policies.kyverno.io/description: >-
+      Ensures that all containers have proper security context configured
+      including read-only root filesystem and dropped capabilities.
+spec:
+  validationFailureAction: enforce
+  background: true
+  rules:
+  - name: validate-security-context
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+    exclude:
+      any:
+      - resources:
+          namespaces:
+          - kube-system
+          - kyverno
+    validate:
+      message: "Security context is required with proper settings"
+      pattern:
+        spec:
+          containers:
+          - securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop:
+                - ALL
+
+---
+# Policy: Add default network policy
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: add-default-network-policy
+  labels:
+    app: kyverno
+    policy-type: mutation
+    severity: low
+  annotations:
+    policies.kyverno.io/title: "Add Default Network Policy"
+    policies.kyverno.io/category: "Network Security"
+    policies.kyverno.io/severity: "low"
+    policies.kyverno.io/subject: "Namespace"
+    policies.kyverno.io/description: >-
+      Automatically adds a default deny-all network policy to new namespaces
+      to implement Zero Trust networking principles.
+spec:
+  rules:
+  - name: add-networkpolicy
+    match:
+      any:
+      - resources:
+          kinds:
+          - Namespace
+    exclude:
+      any:
+      - resources:
+          names:
+          - kube-system
+          - kube-public
+          - kyverno
+          - notary-system
+          - security-system
+    generate:
+      kind: NetworkPolicy
+      name: default-deny-ingress
+      namespace: "{{request.object.metadata.name}}"
+      data:
+        spec:
+          podSelector: {}
+          policyTypes:
+          - Ingress
+
+---
+# Policy: Require service account token auto-mount disabled
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-auto-mount-sa-token
+  labels:
+    app: kyverno
+    policy-type: security
+    severity: medium
+  annotations:
+    policies.kyverno.io/title: "Disallow Service Account Token Auto-Mount"
+    policies.kyverno.io/category: "Service Account Security"
+    policies.kyverno.io/severity: "medium"
+    policies.kyverno.io/subject: "Pod,ServiceAccount"
+    policies.kyverno.io/description: >-
+      Prevents automatic mounting of service account tokens unless explicitly
+      required, reducing the attack surface.
+spec:
+  validationFailureAction: warn  # Start with warn mode for gradual adoption
+  background: true
+  rules:
+  - name: validate-sa-token
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+    exclude:
+      any:
+      - resources:
+          namespaces:
+          - kube-system
+          - kyverno
+    validate:
+      message: "Service account token auto-mounting should be disabled unless required"
+      pattern:
+        spec:
+          automountServiceAccountToken: false
+
+---
+# Policy: Require labels for governance
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-labels
+  labels:
+    app: kyverno
+    policy-type: governance
+    severity: low
+  annotations:
+    policies.kyverno.io/title: "Require Standard Labels"
+    policies.kyverno.io/category: "Governance"
+    policies.kyverno.io/severity: "low"
+    policies.kyverno.io/subject: "Pod"
+    policies.kyverno.io/description: >-
+      Ensures that all pods have required labels for proper governance,
+      monitoring, and cost allocation.
+spec:
+  validationFailureAction: enforce
+  background: true
+  rules:
+  - name: validate-labels
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+    exclude:
+      any:
+      - resources:
+          namespaces:
+          - kube-system
+          - kyverno
+    validate:
+      message: "Required labels are missing"
+      pattern:
+        metadata:
+          labels:
+            app: "?*"
+            version: "?*"
+            environment: "?*"

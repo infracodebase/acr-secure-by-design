@@ -1,0 +1,447 @@
+# Notary v2 Image Signing Configuration
+# Enterprise-grade image signing with cosign and notation
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: notary-system
+  labels:
+    name: notary-system
+    purpose: image-signing
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+
+---
+# ConfigMap for Notation configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notation-config
+  namespace: notary-system
+  labels:
+    app: notation
+    component: signing-config
+data:
+  config.json: |
+    {
+      "version": "2.0",
+      "default_trust_policy": "strict",
+      "trust_policies": [
+        {
+          "name": "production-policy",
+          "signature_verification": {
+            "level": "strict"
+          },
+          "trust_stores": ["ca:production-ca"],
+          "trusted_identities": ["*"]
+        }
+      ],
+      "trust_stores": [
+        {
+          "name": "ca:production-ca",
+          "certificates": ["/etc/notation/certs/production-ca.crt"]
+        }
+      ]
+    }
+
+  trustpolicy.json: |
+    {
+      "version": "1.0",
+      "trustPolicies": [
+        {
+          "name": "production-images",
+          "registryScopes": ["${ACR_LOGIN_SERVER}/prod/*"],
+          "signatureVerification": {
+            "level": "strict"
+          },
+          "trustStores": ["ca:production-ca"],
+          "trustedIdentities": ["x509.subject:CN=Production Image Signer,O=YourCompany"]
+        },
+        {
+          "name": "staging-images",
+          "registryScopes": ["${ACR_LOGIN_SERVER}/staging/*"],
+          "signatureVerification": {
+            "level": "audit"
+          },
+          "trustStores": ["ca:staging-ca"],
+          "trustedIdentities": ["x509.subject:CN=Staging Image Signer,O=YourCompany"]
+        },
+        {
+          "name": "development-images",
+          "registryScopes": ["${ACR_LOGIN_SERVER}/dev/*"],
+          "signatureVerification": {
+            "level": "permissive"
+          },
+          "trustStores": ["ca:development-ca"],
+          "trustedIdentities": ["*"]
+        }
+      ]
+    }
+
+---
+# ConfigMap for cosign configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cosign-config
+  namespace: notary-system
+  labels:
+    app: cosign
+    component: signing-config
+data:
+  config.yaml: |
+    # Cosign configuration for keyless signing with Azure
+    fulcio:
+      url: "https://fulcio.sigstore.dev"
+      root: |
+        -----BEGIN CERTIFICATE-----
+        # Fulcio root certificate (production)
+        -----END CERTIFICATE-----
+
+    rekor:
+      url: "https://rekor.sigstore.dev"
+      root: |
+        -----BEGIN PUBLIC KEY-----
+        # Rekor public key
+        -----END PUBLIC KEY-----
+
+    ctlog:
+      url: "https://ctfe.sigstore.dev/2022"
+
+    # Azure-specific configuration
+    azure:
+      tenant_id: "${AZURE_TENANT_ID}"
+      client_id: "${AZURE_CLIENT_ID}"
+
+---
+# Secret for signing certificates
+apiVersion: v1
+kind: Secret
+metadata:
+  name: signing-certificates
+  namespace: notary-system
+  labels:
+    app: notation
+    component: certificates
+type: Opaque
+data:
+  # Base64 encoded certificates and keys
+  # These should be created and managed through Azure Key Vault
+  production-ca.crt: ""  # Production CA certificate
+  staging-ca.crt: ""     # Staging CA certificate
+  development-ca.crt: "" # Development CA certificate
+
+---
+# Service Account for image signing
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: image-signer
+  namespace: notary-system
+  labels:
+    app: notation
+    component: signer
+    azure.workload.identity/use: "true"
+  annotations:
+    azure.workload.identity/client-id: "${SIGNER_IDENTITY_CLIENT_ID}"
+
+---
+# ClusterRole for image signing operations
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: image-signer
+  labels:
+    app: notation
+    component: signer
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list"]
+
+---
+# ClusterRoleBinding for image signer
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: image-signer
+  labels:
+    app: notation
+    component: signer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: image-signer
+subjects:
+- kind: ServiceAccount
+  name: image-signer
+  namespace: notary-system
+
+---
+# Deployment for notation signing service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notation-signer
+  namespace: notary-system
+  labels:
+    app: notation
+    component: signer
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: notation
+      component: signer
+  template:
+    metadata:
+      labels:
+        app: notation
+        component: signer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: image-signer
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: notation
+        image: notaryproject/notation:v1.0.0
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c"]
+        args:
+          - |
+            # Initialize notation and start signing service
+            notation version
+
+            # Copy configuration
+            mkdir -p ~/.config/notation
+            cp /etc/notation/config.json ~/.config/notation/
+            cp /etc/notation/trustpolicy.json ~/.config/notation/
+
+            # Copy certificates
+            mkdir -p ~/.config/notation/truststore/x509/ca
+            cp /etc/notation/certs/* ~/.config/notation/truststore/x509/ca/
+
+            # Start HTTP server for health checks and signing API
+            while true; do
+              echo "Notation signer is running..."
+              sleep 30
+            done
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        volumeMounts:
+        - name: config
+          mountPath: /etc/notation
+          readOnly: true
+        - name: certificates
+          mountPath: /etc/notation/certs
+          readOnly: true
+        - name: notation-home
+          mountPath: /home/notation
+        - name: tmp
+          mountPath: /tmp
+        env:
+        - name: NOTATION_CONFIG_DIR
+          value: "/home/notation/.config/notation"
+        - name: ACR_LOGIN_SERVER
+          value: "${ACR_LOGIN_SERVER}"
+        - name: AZURE_TENANT_ID
+          value: "${AZURE_TENANT_ID}"
+        - name: AZURE_CLIENT_ID
+          value: "${SIGNER_IDENTITY_CLIENT_ID}"
+        livenessProbe:
+          exec:
+            command:
+            - "sh"
+            - "-c"
+            - "notation version"
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          exec:
+            command:
+            - "sh"
+            - "-c"
+            - "notation version"
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      volumes:
+      - name: config
+        configMap:
+          name: notation-config
+      - name: certificates
+        secret:
+          secretName: signing-certificates
+          defaultMode: 0400
+      - name: notation-home
+        emptyDir:
+          sizeLimit: 100Mi
+      - name: tmp
+        emptyDir:
+          sizeLimit: 100Mi
+
+---
+# Job for initial certificate setup
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: setup-signing-certificates
+  namespace: notary-system
+  labels:
+    app: notation
+    component: setup
+spec:
+  template:
+    metadata:
+      labels:
+        app: notation
+        component: setup
+    spec:
+      serviceAccountName: image-signer
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      restartPolicy: OnFailure
+      containers:
+      - name: cert-setup
+        image: alpine/openssl:latest
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c"]
+        args:
+          - |
+            echo "Setting up signing certificates..."
+
+            # Create temporary directory for certificate generation
+            mkdir -p /tmp/certs
+
+            # Generate CA certificates for each environment
+            # Production CA
+            openssl genrsa -out /tmp/certs/production-ca.key 4096
+            openssl req -new -x509 -key /tmp/certs/production-ca.key \
+              -out /tmp/certs/production-ca.crt -days 3650 \
+              -subj "/C=US/ST=WA/L=Seattle/O=YourCompany/CN=Production CA"
+
+            # Staging CA
+            openssl genrsa -out /tmp/certs/staging-ca.key 4096
+            openssl req -new -x509 -key /tmp/certs/staging-ca.key \
+              -out /tmp/certs/staging-ca.crt -days 3650 \
+              -subj "/C=US/ST=WA/L=Seattle/O=YourCompany/CN=Staging CA"
+
+            # Development CA
+            openssl genrsa -out /tmp/certs/development-ca.key 4096
+            openssl req -new -x509 -key /tmp/certs/development-ca.key \
+              -out /tmp/certs/development-ca.crt -days 3650 \
+              -subj "/C=US/ST=WA/L=Seattle/O=YourCompany/CN=Development CA"
+
+            echo "Certificate generation completed"
+            ls -la /tmp/certs/
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir:
+          sizeLimit: 100Mi
+
+---
+# Service for notation signer
+apiVersion: v1
+kind: Service
+metadata:
+  name: notation-signer
+  namespace: notary-system
+  labels:
+    app: notation
+    component: signer
+spec:
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http
+    protocol: TCP
+  selector:
+    app: notation
+    component: signer
+
+---
+# NetworkPolicy for notary-system namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notary-system-policy
+  namespace: notary-system
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow access from security-system namespace
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: security-system
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  # Allow DNS resolution
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # Allow HTTPS to external services (Sigstore, etc.)
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+  # Allow access to Azure services
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443

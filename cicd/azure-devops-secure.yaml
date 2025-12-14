@@ -1,0 +1,405 @@
+# Azure DevOps Secure CI/CD Pipeline for Zero Trust ACR
+# Production-ready pipeline with comprehensive security controls
+
+trigger:
+  branches:
+    include:
+    - main
+    - develop
+  paths:
+    include:
+    - src/*
+    - Dockerfile
+    - azure-pipelines.yml
+
+pr:
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - src/*
+    - Dockerfile
+
+variables:
+  # Azure Configuration
+  - group: acr-variables  # Variable group containing sensitive values
+  - name: acrName
+    value: $(ACR_NAME)
+  - name: acrLoginServer
+    value: $(ACR_LOGIN_SERVER)
+  - name: aksClusterName
+    value: $(AKS_CLUSTER_NAME)
+  - name: aksResourceGroup
+    value: $(AKS_RESOURCE_GROUP)
+
+  # Image Configuration
+  - name: imageName
+    value: 'web-app'
+  - name: imageTag
+    value: '$(Build.SourceVersion)'
+
+  # Security Configuration
+  - name: trivyVersion
+    value: '0.48.0'
+  - name: cosignVersion
+    value: '2.2.1'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: SecurityScan
+  displayName: 'Security Scan Stage'
+  jobs:
+  - job: RepositoryScan
+    displayName: 'Repository Security Scan'
+    steps:
+    - checkout: self
+      fetchDepth: 0  # Full history for better security scanning
+      displayName: 'Checkout source code'
+
+    - task: CredScan@3
+      displayName: 'Run Credential Scanner'
+      inputs:
+        toolMajorVersion: 'V2'
+        outputFormat: 'sarif'
+        debugMode: false
+
+    - task: SdtReport@2
+      displayName: 'Generate Security Report'
+      inputs:
+        GdnExportAllTools: true
+        GdnExportGdnToolSarifFile: true
+
+    - task: PublishSecurityAnalysisLogs@3
+      displayName: 'Publish Security Analysis Logs'
+      inputs:
+        ArtifactName: 'CodeAnalysisLogs'
+        ArtifactType: 'Container'
+
+    - task: PostAnalysis@2
+      displayName: 'Post Analysis'
+      inputs:
+        GdnBreakAllTools: false
+        GdnBreakPolicy: 'Microsoft'
+        GdnBreakPolicyMinSev: 'Warning'
+
+  - job: InfrastructureScan
+    displayName: 'Infrastructure Security Scan'
+    steps:
+    - checkout: self
+      displayName: 'Checkout source code'
+
+    - task: UsePythonVersion@0
+      displayName: 'Use Python 3.11'
+      inputs:
+        versionSpec: '3.11'
+
+    - script: |
+        pip install checkov
+      displayName: 'Install Checkov'
+
+    - script: |
+        checkov -d terraform/ --framework terraform \
+          --output cli --output sarif --output-file-path checkov-results.sarif \
+          --check CKV_AZURE_* --check CKV_K8S_* \
+          --skip-check CKV_DOCKER_* \
+          --soft-fail
+      displayName: 'Run Checkov IaC Scanner'
+
+    - task: PublishTestResults@2
+      displayName: 'Publish Checkov Results'
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: 'checkov-results.xml'
+        testRunTitle: 'Infrastructure Security Scan'
+      condition: always()
+
+- stage: BuildAndScan
+  displayName: 'Build and Scan Container'
+  dependsOn: SecurityScan
+  jobs:
+  - job: BuildContainer
+    displayName: 'Build and Scan Container Image'
+    steps:
+    - checkout: self
+      displayName: 'Checkout source code'
+
+    - task: AzureCLI@2
+      displayName: 'Azure Login and ACR Login'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az acr login --name $(acrName)
+
+    - task: Docker@2
+      displayName: 'Build container image'
+      inputs:
+        containerRegistry: '$(acrServiceConnection)'
+        repository: '$(imageName)'
+        command: 'build'
+        Dockerfile: 'Dockerfile'
+        tags: |
+          $(imageTag)
+          latest
+
+    - script: |
+        # Install Trivy
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        sudo sh -c 'echo "deb https://aquasecurity.github.io/trivy-repo/deb generic main" > /etc/apt/sources.list.d/trivy.list'
+        sudo apt-get update
+        sudo apt-get install trivy=$(trivyVersion)
+      displayName: 'Install Trivy'
+
+    - script: |
+        trivy image \
+          --exit-code 1 \
+          --format sarif \
+          --output trivy-results.sarif \
+          --severity CRITICAL,HIGH \
+          --ignore-unfixed \
+          $(acrLoginServer)/$(imageName):$(imageTag)
+      displayName: 'Scan container image with Trivy'
+      continueOnError: false
+
+    - task: PublishTestResults@2
+      displayName: 'Publish Trivy Scan Results'
+      inputs:
+        testResultsFormat: 'VSTest'
+        testResultsFiles: 'trivy-results.sarif'
+        testRunTitle: 'Container Security Scan'
+      condition: always()
+
+    - script: |
+        # Install Syft for SBOM generation
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+        # Generate SBOM
+        syft $(acrLoginServer)/$(imageName):$(imageTag) -o spdx-json=sbom.spdx.json
+
+        # Install Grype for vulnerability scanning
+        curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+        # Scan SBOM for vulnerabilities
+        grype sbom:sbom.spdx.json -o json > vulnerability-report.json
+      displayName: 'Generate SBOM and Vulnerability Report'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish SBOM and Vulnerability Report'
+      inputs:
+        pathToPublish: '.'
+        artifactName: 'security-artifacts'
+        includePattern: |
+          sbom.spdx.json
+          vulnerability-report.json
+          trivy-results.sarif
+
+    - task: Docker@2
+      displayName: 'Push container image'
+      inputs:
+        containerRegistry: '$(acrServiceConnection)'
+        repository: '$(imageName)'
+        command: 'push'
+        tags: |
+          $(imageTag)
+          latest
+      condition: succeeded()
+
+- stage: SignImage
+  displayName: 'Sign Container Image'
+  dependsOn: BuildAndScan
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: SignContainer
+    displayName: 'Sign Container with Cosign'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Install Cosign and Sign Image'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Install cosign
+          curl -O -L "https://github.com/sigstore/cosign/releases/download/v$(cosignVersion)/cosign-linux-amd64"
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+          sudo chmod +x /usr/local/bin/cosign
+
+          # Login to ACR
+          az acr login --name $(acrName)
+
+          # Get image digest
+          IMAGE_DIGEST=$(az acr repository show \
+            --name $(acrName) \
+            --image $(imageName):$(imageTag) \
+            --query digest -o tsv)
+
+          # Sign the image using Azure identity (OIDC)
+          export COSIGN_EXPERIMENTAL=1
+          cosign sign --yes $(acrLoginServer)/$(imageName)@${IMAGE_DIGEST}
+
+          # Verify the signature
+          cosign verify \
+            --certificate-identity-regexp=".*$(System.TeamProject).*" \
+            --certificate-oidc-issuer="https://vstoken.dev.azure.com/$(System.CollectionId)" \
+            $(acrLoginServer)/$(imageName)@${IMAGE_DIGEST}
+
+          echo "Image successfully signed and verified"
+
+- stage: DeployStaging
+  displayName: 'Deploy to Staging'
+  dependsOn:
+  - BuildAndScan
+  - SignImage
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+  jobs:
+  - deployment: StagingDeployment
+    displayName: 'Deploy to Staging Environment'
+    environment: 'staging'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: 'Deploy to AKS Staging'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Get AKS credentials
+                az aks get-credentials \
+                  --resource-group $(aksResourceGroup) \
+                  --name $(aksClusterName)
+
+                # Deploy to staging namespace
+                kubectl set image deployment/$(imageName) \
+                  $(imageName)=$(acrLoginServer)/$(imageName):$(imageTag) \
+                  -n staging
+
+                # Wait for rollout to complete
+                kubectl rollout status deployment/$(imageName) -n staging --timeout=300s
+
+                # Verify deployment
+                kubectl get pods -n staging -l app=$(imageName)
+
+- stage: DeployProduction
+  displayName: 'Deploy to Production'
+  dependsOn:
+  - BuildAndScan
+  - SignImage
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: ProductionDeployment
+    displayName: 'Deploy to Production Environment'
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: 'Verify Signature Before Deployment'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Install cosign
+                curl -O -L "https://github.com/sigstore/cosign/releases/download/v$(cosignVersion)/cosign-linux-amd64"
+                sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+                sudo chmod +x /usr/local/bin/cosign
+
+                # Login to ACR
+                az acr login --name $(acrName)
+
+                # Get image digest
+                IMAGE_DIGEST=$(az acr repository show \
+                  --name $(acrName) \
+                  --image $(imageName):$(imageTag) \
+                  --query digest -o tsv)
+
+                # Verify signature before deployment
+                export COSIGN_EXPERIMENTAL=1
+                cosign verify \
+                  --certificate-identity-regexp=".*$(System.TeamProject).*" \
+                  --certificate-oidc-issuer="https://vstoken.dev.azure.com/$(System.CollectionId)" \
+                  $(acrLoginServer)/$(imageName)@${IMAGE_DIGEST}
+
+                echo "Image signature verified successfully"
+
+          - task: AzureCLI@2
+            displayName: 'Deploy to AKS Production'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Get AKS credentials
+                az aks get-credentials \
+                  --resource-group $(aksResourceGroup) \
+                  --name $(aksClusterName)
+
+                # Deploy to production namespace
+                kubectl set image deployment/$(imageName) \
+                  $(imageName)=$(acrLoginServer)/$(imageName):$(imageTag) \
+                  -n production
+
+                # Wait for rollout to complete
+                kubectl rollout status deployment/$(imageName) -n production --timeout=300s
+
+                # Run smoke tests
+                kubectl exec -n production deployment/$(imageName) -- \
+                  /bin/sh -c "curl -f http://localhost:8080/health"
+
+          - task: AzureCLI@2
+            displayName: 'Compliance Check'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Get AKS credentials
+                az aks get-credentials \
+                  --resource-group $(aksResourceGroup) \
+                  --name $(aksClusterName)
+
+                # Check policy compliance
+                kubectl get policyreport -A
+
+                # Check for any policy violations
+                VIOLATIONS=$(kubectl get policyreport -A -o json | \
+                  jq '.items[] | select(.summary.fail > 0) | .metadata.name' | wc -l)
+
+                if [ "$VIOLATIONS" -gt 0 ]; then
+                  echo "Policy violations found!"
+                  kubectl get policyreport -A -o yaml
+                  exit 1
+                fi
+
+                echo "All policies are compliant"
+
+                # Generate compliance report
+                cat > compliance-report.md << EOF
+                # Compliance Report
+                Generated: $(date)
+
+                ## Image Details
+                - Image: $(acrLoginServer)/$(imageName):$(imageTag)
+                - Signed: ✓
+                - SBOM: ✓
+                - Security Scan: ✓
+
+                ## Deployment Status
+                - Environment: Production
+                - Status: Successful
+                - Policies: Compliant
+                EOF
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Compliance Report'
+            inputs:
+              pathToPublish: 'compliance-report.md'
+              artifactName: 'compliance-report'

@@ -1,0 +1,77 @@
+# Zero Trust ACR Configuration Example
+# Copy this file to terraform.tfvars and customize values
+
+# Environment Configuration
+environment    = "prod"
+location       = "East US"
+company_prefix = "zt"
+
+# Tagging
+owner       = "Infrastructure Team"
+cost_center = "IT-001"
+
+# Network Security
+allowed_cidr_ranges = [
+  # "203.0.113.0/24"  # Example: On-premises network
+]
+
+# ACR Configuration
+retention_days_untagged     = 7
+enable_zone_redundancy      = true
+geo_replication_locations   = ["West US 2", "Central US"]
+cmk_enabled                = true
+
+# Logging
+log_retention_days = 90
+
+# AKS Configuration
+kubernetes_version          = "1.28"
+system_node_count          = 3
+user_node_count_min        = 2
+user_node_count_max        = 10
+node_vm_size              = "Standard_D4s_v3"
+enable_auto_scaling       = true
+enable_network_policy     = "azure"
+
+# Security Features
+enable_azure_policy           = true
+enable_secret_store_csi       = true
+enable_workload_identity      = true
+enable_oidc_issuer           = true
+enable_defender_for_containers = true
+enable_image_cleaner         = true
+enable_gpu_nodes             = false
+
+# Monitoring
+enable_container_insights = true
+enable_prometheus        = true
+enable_grafana          = true
+
+# Identity (Optional - will use current context if not specified)
+# aad_admin_group_object_id = "12345678-1234-1234-1234-123456789012"
+# aad_tenant_id            = "12345678-1234-1234-1234-123456789012"
+
+# CI/CD (Optional)
+enable_acr_tasks = false
+# github_org      = "your-org"
+# github_repo     = "your-repo"
+# github_token    = "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+default_branch  = "main"
+
+# Advanced Configuration
+max_pods_per_node        = 30
+enable_ultra_ssd        = false
+load_balancer_sku       = "standard"
+outbound_type          = "loadBalancer"
+private_cluster_enabled = true
+enable_backup          = true
+backup_retention_days  = 30
+
+# Maintenance Window
+maintenance_window = {
+  allowed = [{
+    day   = "Sunday"
+    hours = [2, 3, 4, 5]
+  }]
+  not_allowed = []
+}

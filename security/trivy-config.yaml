@@ -1,0 +1,307 @@
+# Trivy Security Scanner Configuration
+# Enterprise-grade vulnerability scanning with SBOM generation
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trivy-config
+  namespace: security-system
+  labels:
+    app: trivy
+    component: security-scanner
+data:
+  trivy.yaml: |
+    # Cache configuration
+    cache:
+      dir: "/var/cache/trivy"
+      clean: false
+
+    # Database configuration
+    db:
+      repository: "ghcr.io/aquasecurity/trivy-db"
+      skip-update: false
+
+    # Vulnerability scanning configuration
+    vulnerability:
+      type: ["os", "library"]
+      scanners: ["vuln"]
+
+    # Security check configuration
+    security-checks: ["vuln", "config", "secret"]
+
+    # Output configuration
+    format: "json"
+    output: "/tmp/scan-results.json"
+
+    # Severity configuration
+    severity: ["UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+
+    # Exit code configuration
+    exit-code: 1
+    exit-on-eol: 1
+
+    # Registry configuration
+    registry:
+      insecure: false
+
+    # Report configuration
+    report:
+      format: ["json", "sarif"]
+
+    # SBOM configuration
+    sbom:
+      format: "spdx-json"
+      output: "/tmp/sbom.json"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trivy-policies
+  namespace: security-system
+  labels:
+    app: trivy
+    component: policies
+data:
+  vulnerability-policy.rego: |
+    package trivy
+
+    import future.keywords.contains
+    import future.keywords.if
+
+    # Deny if any CRITICAL vulnerabilities are found
+    deny[res] {
+        input.Results[_].Vulnerabilities[_].Severity == "CRITICAL"
+        res := "CRITICAL vulnerabilities found - image rejected"
+    }
+
+    # Deny if HIGH vulnerabilities exceed threshold
+    deny[res] {
+        high_vulns := count([vuln | vuln := input.Results[_].Vulnerabilities[_]; vuln.Severity == "HIGH"])
+        high_vulns > 5
+        res := sprintf("Too many HIGH vulnerabilities found: %d (max: 5)", [high_vulns])
+    }
+
+    # Deny if known exploited vulnerabilities are present
+    deny[res] {
+        input.Results[_].Vulnerabilities[_].References[_] contains "https://www.cisa.gov/known-exploited-vulnerabilities-catalog"
+        res := "Known exploited vulnerability found - image rejected"
+    }
+
+  secret-policy.rego: |
+    package trivy
+
+    import future.keywords.contains
+    import future.keywords.if
+
+    # Deny if secrets are found
+    deny[res] {
+        input.Results[_].Secrets[_]
+        res := "Secrets found in image - image rejected"
+    }
+
+    # Deny if sensitive files are present
+    deny[res] {
+        input.Results[_].Misconfigurations[_].Message contains "private key"
+        res := "Private key found in image - image rejected"
+    }
+
+  misconfiguration-policy.rego: |
+    package trivy
+
+    import future.keywords.contains
+    import future.keywords.if
+
+    # Deny if running as root
+    deny[res] {
+        input.Results[_].Misconfigurations[_].ID == "DS002"
+        res := "Container running as root user - image rejected"
+    }
+
+    # Deny if using latest tag
+    deny[res] {
+        input.Results[_].Misconfigurations[_].ID == "DS006"
+        res := "Image using latest tag - image rejected"
+    }
+
+---
+# Trivy Deployment for in-cluster scanning
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trivy-scanner
+  namespace: security-system
+  labels:
+    app: trivy
+    component: scanner
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: trivy
+      component: scanner
+  template:
+    metadata:
+      labels:
+        app: trivy
+        component: scanner
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: trivy-scanner
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: trivy
+        image: aquasec/trivy:0.48.0
+        imagePullPolicy: IfNotPresent
+        command: ["trivy"]
+        args:
+          - "server"
+          - "--listen=0.0.0.0:8080"
+          - "--cache-dir=/var/cache/trivy"
+          - "--config=/etc/trivy/trivy.yaml"
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+          requests:
+            cpu: 500m
+            memory: 1Gi
+        volumeMounts:
+        - name: config
+          mountPath: /etc/trivy
+          readOnly: true
+        - name: cache
+          mountPath: /var/cache/trivy
+        - name: tmp
+          mountPath: /tmp
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: trivy-config
+      - name: cache
+        emptyDir:
+          sizeLimit: 10Gi
+      - name: tmp
+        emptyDir:
+          sizeLimit: 1Gi
+
+---
+# Service for Trivy scanner
+apiVersion: v1
+kind: Service
+metadata:
+  name: trivy-scanner
+  namespace: security-system
+  labels:
+    app: trivy
+    component: scanner
+spec:
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http
+    protocol: TCP
+  selector:
+    app: trivy
+    component: scanner
+
+---
+# ServiceAccount for Trivy scanner
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: trivy-scanner
+  namespace: security-system
+  labels:
+    app: trivy
+    component: scanner
+automountServiceAccountToken: false
+
+---
+# ClusterRole for image scanning
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: trivy-scanner
+  labels:
+    app: trivy
+    component: scanner
+rules:
+- apiGroups: [""]
+  resources: ["pods", "replicationcontrollers"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["replicasets", "deployments", "daemonsets", "statefulsets"]
+  verbs: ["get", "list"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list"]
+
+---
+# ClusterRoleBinding for Trivy scanner
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: trivy-scanner
+  labels:
+    app: trivy
+    component: scanner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: trivy-scanner
+subjects:
+- kind: ServiceAccount
+  name: trivy-scanner
+  namespace: security-system
+
+---
+# ServiceMonitor for Prometheus monitoring
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: trivy-scanner
+  namespace: security-system
+  labels:
+    app: trivy
+    component: scanner
+spec:
+  selector:
+    matchLabels:
+      app: trivy
+      component: scanner
+  endpoints:
+  - port: http
+    interval: 30s
+    path: /metrics

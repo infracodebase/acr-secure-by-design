@@ -1,0 +1,412 @@
+# Cosign Setup for Container Image Signing
+# Keyless signing with OIDC and Azure integration
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cosign-config
+  namespace: notary-system
+  labels:
+    app: cosign
+    component: keyless-signing
+data:
+  cosign.yaml: |
+    # Cosign configuration for keyless signing
+    fulcio-url: "https://fulcio.sigstore.dev"
+    rekor-url: "https://rekor.sigstore.dev"
+    ctlog-url: "https://ctfe.sigstore.dev/2022"
+
+    # Trust root configuration
+    trust-root:
+      fulcio-certs: |
+        -----BEGIN CERTIFICATE-----
+        # Sigstore Fulcio root certificate
+        -----END CERTIFICATE-----
+
+      rekor-keys: |
+        -----BEGIN PUBLIC KEY-----
+        # Sigstore Rekor public key
+        -----END PUBLIC KEY-----
+
+    # Azure-specific OIDC configuration
+    oidc:
+      issuer: "https://login.microsoftonline.com/${AZURE_TENANT_ID}/v2.0"
+      client-id: "${AZURE_CLIENT_ID}"
+
+  policy.yaml: |
+    # Sigstore policy configuration
+    apiVersion: policy.sigstore.dev/v1beta1
+    kind: ClusterImagePolicy
+    metadata:
+      name: signed-images-policy
+    spec:
+      images:
+      - glob: "${ACR_LOGIN_SERVER}/prod/**"
+        keyless:
+        - issuer: "https://login.microsoftonline.com/${AZURE_TENANT_ID}/v2.0"
+          subject: "https://github.com/${GITHUB_ORG}/${GITHUB_REPO}/.github/workflows/release.yml@refs/heads/main"
+        - issuer: "https://token.actions.githubusercontent.com"
+          subject: "repo:${GITHUB_ORG}/${GITHUB_REPO}:ref:refs/heads/main"
+        ctlog:
+          url: "https://ctfe.sigstore.dev/2022"
+      - glob: "${ACR_LOGIN_SERVER}/staging/**"
+        keyless:
+        - issuer: "https://login.microsoftonline.com/${AZURE_TENANT_ID}/v2.0"
+          subject: "https://github.com/${GITHUB_ORG}/${GITHUB_REPO}/.github/workflows/staging.yml@refs/heads/develop"
+        ctlog:
+          url: "https://ctfe.sigstore.dev/2022"
+
+---
+# ServiceAccount for cosign operations
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cosign-signer
+  namespace: notary-system
+  labels:
+    app: cosign
+    component: signer
+    azure.workload.identity/use: "true"
+  annotations:
+    azure.workload.identity/client-id: "${COSIGN_IDENTITY_CLIENT_ID}"
+
+---
+# ClusterRole for cosign operations
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cosign-signer
+  labels:
+    app: cosign
+    component: signer
+rules:
+- apiGroups: [""]
+  resources: ["secrets", "configmaps"]
+  verbs: ["get", "list", "create", "update"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list"]
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["get", "list", "create"]
+
+---
+# ClusterRoleBinding for cosign signer
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cosign-signer
+  labels:
+    app: cosign
+    component: signer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cosign-signer
+subjects:
+- kind: ServiceAccount
+  name: cosign-signer
+  namespace: notary-system
+
+---
+# Deployment for cosign signing service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cosign-signer
+  namespace: notary-system
+  labels:
+    app: cosign
+    component: signer
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cosign
+      component: signer
+  template:
+    metadata:
+      labels:
+        app: cosign
+        component: signer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: cosign-signer
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: cosign
+        image: gcr.io/projectsigstore/cosign:v2.2.1
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c"]
+        args:
+          - |
+            # Initialize cosign configuration
+            echo "Initializing cosign..."
+            cosign version
+
+            # Set up OIDC configuration
+            export COSIGN_EXPERIMENTAL=1
+            export COSIGN_FULCIO_URL="https://fulcio.sigstore.dev"
+            export COSIGN_REKOR_URL="https://rekor.sigstore.dev"
+
+            # Start HTTP server for health checks and signing API
+            cat > /tmp/server.py << 'EOF'
+            #!/usr/bin/env python3
+            import http.server
+            import socketserver
+            import json
+            import subprocess
+            import os
+            from urllib.parse import urlparse, parse_qs
+
+            class CosignHandler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    if self.path == '/health':
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        self.wfile.write(b'{"status": "healthy"}')
+                    elif self.path == '/version':
+                        self.send_response(200)
+                        self.send_header('Content-type', 'application/json')
+                        self.end_headers()
+                        try:
+                            result = subprocess.run(['cosign', 'version'],
+                                                  capture_output=True, text=True)
+                            self.wfile.write(result.stdout.encode())
+                        except Exception as e:
+                            self.wfile.write(f'{{"error": "{str(e)}"}}'.encode())
+                    else:
+                        self.send_error(404)
+
+                def do_POST(self):
+                    if self.path == '/sign':
+                        content_length = int(self.headers['Content-Length'])
+                        post_data = self.rfile.read(content_length)
+                        try:
+                            data = json.loads(post_data.decode('utf-8'))
+                            image = data.get('image')
+                            if image:
+                                # Perform keyless signing
+                                result = subprocess.run([
+                                    'cosign', 'sign', '--yes', image
+                                ], capture_output=True, text=True, env=os.environ)
+
+                                if result.returncode == 0:
+                                    self.send_response(200)
+                                    self.send_header('Content-type', 'application/json')
+                                    self.end_headers()
+                                    response = {
+                                        "status": "success",
+                                        "image": image,
+                                        "signature": "signed"
+                                    }
+                                    self.wfile.write(json.dumps(response).encode())
+                                else:
+                                    self.send_response(500)
+                                    self.send_header('Content-type', 'application/json')
+                                    self.end_headers()
+                                    response = {
+                                        "status": "error",
+                                        "error": result.stderr
+                                    }
+                                    self.wfile.write(json.dumps(response).encode())
+                            else:
+                                self.send_error(400, "Missing image parameter")
+                        except Exception as e:
+                            self.send_error(500, str(e))
+                    else:
+                        self.send_error(404)
+
+            if __name__ == "__main__":
+                PORT = 8080
+                Handler = CosignHandler
+                with socketserver.TCPServer(("", PORT), Handler) as httpd:
+                    print(f"Cosign signing server serving at port {PORT}")
+                    httpd.serve_forever()
+            EOF
+
+            python3 /tmp/server.py
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        volumeMounts:
+        - name: config
+          mountPath: /etc/cosign
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        env:
+        - name: COSIGN_EXPERIMENTAL
+          value: "1"
+        - name: COSIGN_FULCIO_URL
+          value: "https://fulcio.sigstore.dev"
+        - name: COSIGN_REKOR_URL
+          value: "https://rekor.sigstore.dev"
+        - name: AZURE_TENANT_ID
+          value: "${AZURE_TENANT_ID}"
+        - name: AZURE_CLIENT_ID
+          value: "${COSIGN_IDENTITY_CLIENT_ID}"
+        - name: ACR_LOGIN_SERVER
+          value: "${ACR_LOGIN_SERVER}"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: cosign-config
+      - name: tmp
+        emptyDir:
+          sizeLimit: 100Mi
+
+---
+# Service for cosign signer
+apiVersion: v1
+kind: Service
+metadata:
+  name: cosign-signer
+  namespace: notary-system
+  labels:
+    app: cosign
+    component: signer
+spec:
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http
+    protocol: TCP
+  selector:
+    app: cosign
+    component: signer
+
+---
+# CronJob for automated signature verification
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: verify-signatures
+  namespace: notary-system
+  labels:
+    app: cosign
+    component: verification
+spec:
+  schedule: "0 */6 * * *"  # Every 6 hours
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: cosign
+            component: verification
+        spec:
+          serviceAccountName: cosign-signer
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          restartPolicy: OnFailure
+          containers:
+          - name: verify
+            image: gcr.io/projectsigstore/cosign:v2.2.1
+            imagePullPolicy: IfNotPresent
+            command: ["sh", "-c"]
+            args:
+              - |
+                echo "Starting signature verification..."
+
+                # Set environment for experimental features
+                export COSIGN_EXPERIMENTAL=1
+
+                # Example images to verify (replace with actual registry URLs)
+                IMAGES=(
+                  "${ACR_LOGIN_SERVER}/prod/web-app:latest"
+                  "${ACR_LOGIN_SERVER}/prod/api-server:latest"
+                  "${ACR_LOGIN_SERVER}/staging/web-app:latest"
+                )
+
+                FAILED_VERIFICATIONS=0
+
+                for image in "${IMAGES[@]}"; do
+                  echo "Verifying signature for: $image"
+
+                  if cosign verify "$image" \
+                    --certificate-identity-regexp=".*${GITHUB_ORG}.*" \
+                    --certificate-oidc-issuer="https://token.actions.githubusercontent.com"; then
+                    echo "✓ Signature verification passed for: $image"
+                  else
+                    echo "✗ Signature verification failed for: $image"
+                    FAILED_VERIFICATIONS=$((FAILED_VERIFICATIONS + 1))
+                  fi
+                done
+
+                if [ $FAILED_VERIFICATIONS -gt 0 ]; then
+                  echo "ERROR: $FAILED_VERIFICATIONS signature verification(s) failed"
+                  exit 1
+                else
+                  echo "All signature verifications passed"
+                fi
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop:
+                - ALL
+            resources:
+              limits:
+                cpu: 500m
+                memory: 512Mi
+              requests:
+                cpu: 200m
+                memory: 256Mi
+            volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            env:
+            - name: COSIGN_EXPERIMENTAL
+              value: "1"
+            - name: ACR_LOGIN_SERVER
+              value: "${ACR_LOGIN_SERVER}"
+            - name: GITHUB_ORG
+              value: "${GITHUB_ORG}"
+          volumes:
+          - name: tmp
+            emptyDir:
+              sizeLimit: 100Mi

@@ -1,0 +1,375 @@
+# OPA Gatekeeper Policies (Alternative to Kyverno)
+# Constraint Templates and Constraints for admission control
+
+# Constraint Template: Require trusted registry
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredregistry
+  labels:
+    app: gatekeeper
+    policy-type: security
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredRegistry
+      validation:
+        type: object
+        properties:
+          allowedRegistries:
+            type: array
+            items:
+              type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredregistry
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not starts_with(container.image, input.parameters.allowedRegistries[_])
+          msg := sprintf("Image '%v' is not from an allowed registry. Allowed registries: %v", [container.image, input.parameters.allowedRegistries])
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.initContainers[_]
+          not starts_with(container.image, input.parameters.allowedRegistries[_])
+          msg := sprintf("Init container image '%v' is not from an allowed registry. Allowed registries: %v", [container.image, input.parameters.allowedRegistries])
+        }
+
+---
+# Constraint: Enforce trusted registry
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredRegistry
+metadata:
+  name: must-use-trusted-registry
+  labels:
+    app: gatekeeper
+    policy-type: security
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    excludedNamespaces: ["kube-system", "gatekeeper-system"]
+  parameters:
+    allowedRegistries:
+      - "${ACR_LOGIN_SERVER}"
+
+---
+# Constraint Template: Disallow latest tag
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8sdisallowlatesttag
+  labels:
+    app: gatekeeper
+    policy-type: best-practices
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sDisallowLatestTag
+      validation:
+        type: object
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sdisallowlatesttag
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          image_parts := split(container.image, ":")
+          count(image_parts) == 1
+          msg := sprintf("Image '%v' is missing a tag. Latest tag is not allowed.", [container.image])
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          image_parts := split(container.image, ":")
+          image_parts[1] == "latest"
+          msg := sprintf("Image '%v' uses 'latest' tag which is not allowed.", [container.image])
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.initContainers[_]
+          image_parts := split(container.image, ":")
+          count(image_parts) == 1
+          msg := sprintf("Init container image '%v' is missing a tag. Latest tag is not allowed.", [container.image])
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.initContainers[_]
+          image_parts := split(container.image, ":")
+          image_parts[1] == "latest"
+          msg := sprintf("Init container image '%v' uses 'latest' tag which is not allowed.", [container.image])
+        }
+
+---
+# Constraint: Disallow latest tag
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sDisallowLatestTag
+metadata:
+  name: no-latest-tags
+  labels:
+    app: gatekeeper
+    policy-type: best-practices
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    excludedNamespaces: ["kube-system", "gatekeeper-system"]
+
+---
+# Constraint Template: Require resource limits
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredresources
+  labels:
+    app: gatekeeper
+    policy-type: resource-management
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredResources
+      validation:
+        type: object
+        properties:
+          limits:
+            type: array
+            items:
+              type: string
+          requests:
+            type: array
+            items:
+              type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredresources
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          required_limit := input.parameters.limits[_]
+          not container.resources.limits[required_limit]
+          msg := sprintf("Container '%v' is missing required resource limit '%v'", [container.name, required_limit])
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          required_request := input.parameters.requests[_]
+          not container.resources.requests[required_request]
+          msg := sprintf("Container '%v' is missing required resource request '%v'", [container.name, required_request])
+        }
+
+---
+# Constraint: Require resource limits
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredResources
+metadata:
+  name: must-have-resources
+  labels:
+    app: gatekeeper
+    policy-type: resource-management
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    excludedNamespaces: ["kube-system", "gatekeeper-system"]
+  parameters:
+    limits: ["memory", "cpu"]
+    requests: ["memory", "cpu"]
+
+---
+# Constraint Template: Disallow privileged containers
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8spsprivileged
+  labels:
+    app: gatekeeper
+    policy-type: security
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sPSPrivileged
+      validation:
+        type: object
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8spsprivileged
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          container.securityContext.privileged == true
+          msg := sprintf("Privileged container is not allowed: %v", [container.name])
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.initContainers[_]
+          container.securityContext.privileged == true
+          msg := sprintf("Privileged init container is not allowed: %v", [container.name])
+        }
+
+        violation[{"msg": msg}] {
+          input.review.object.spec.securityContext.privileged == true
+          msg := "Privileged pod security context is not allowed"
+        }
+
+---
+# Constraint: Disallow privileged containers
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sPSPrivileged
+metadata:
+  name: psp-privileged
+  labels:
+    app: gatekeeper
+    policy-type: security
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    excludedNamespaces: ["kube-system", "gatekeeper-system"]
+
+---
+# Constraint Template: Require non-root user
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8spsrunasnonroot
+  labels:
+    app: gatekeeper
+    policy-type: security
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sPSRunAsNonRoot
+      validation:
+        type: object
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8spsrunasnonroot
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          has_security_context(container)
+          container.securityContext.runAsNonRoot == false
+          msg := sprintf("Container '%v' must run as non-root user", [container.name])
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          has_security_context(container)
+          container.securityContext.runAsUser == 0
+          msg := sprintf("Container '%v' cannot run as root user (UID 0)", [container.name])
+        }
+
+        violation[{"msg": msg}] {
+          input.review.object.spec.securityContext.runAsNonRoot == false
+          msg := "Pod must run as non-root user"
+        }
+
+        has_security_context(container) {
+          container.securityContext
+        }
+
+---
+# Constraint: Require non-root user
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sPSRunAsNonRoot
+metadata:
+  name: psp-run-as-non-root
+  labels:
+    app: gatekeeper
+    policy-type: security
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    excludedNamespaces: ["kube-system", "gatekeeper-system"]
+
+---
+# Constraint Template: Require labels
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels
+  labels:
+    app: gatekeeper
+    policy-type: governance
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredLabels
+      validation:
+        type: object
+        properties:
+          labels:
+            type: array
+            items:
+              type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredlabels
+
+        violation[{"msg": msg}] {
+          required := input.parameters.labels
+          provided := input.review.object.metadata.labels
+          missing := required[_]
+          not provided[missing]
+          msg := sprintf("Missing required label: %v", [missing])
+        }
+
+---
+# Constraint: Require standard labels
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredLabels
+metadata:
+  name: must-have-labels
+  labels:
+    app: gatekeeper
+    policy-type: governance
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "ReplicaSet", "StatefulSet", "DaemonSet"]
+    excludedNamespaces: ["kube-system", "gatekeeper-system"]
+  parameters:
+    labels: ["app", "version", "environment"]
+
+---
+# Config for Gatekeeper
+apiVersion: config.gatekeeper.sh/v1alpha1
+kind: Config
+metadata:
+  name: config
+  namespace: gatekeeper-system
+spec:
+  match:
+    - excludedNamespaces: ["kube-system", "gatekeeper-system"]
+      processes: ["*"]
+  validation:
+    traces:
+      - user:
+          kind:
+            group: "*"
+            version: "*"
+            kind: "*"
+  readiness:
+    statsEnabled: true

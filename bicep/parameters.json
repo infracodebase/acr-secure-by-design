@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environment": {
+      "value": "prod"
+    },
+    "location": {
+      "value": "eastus"
+    },
+    "companyPrefix": {
+      "value": "zt"
+    },
+    "owner": {
+      "value": "Infrastructure Team"
+    },
+    "costCenter": {
+      "value": "IT-001"
+    },
+    "logRetentionDays": {
+      "value": 90
+    }
+  }
+}

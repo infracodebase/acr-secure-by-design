@@ -1,0 +1,57 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+*.tfvars.json
+*_override.tf
+*_override.tf.json
+override.tf
+override.tf.json
+.terraformrc
+terraform.rc
+
+# Bicep
+*.bicep.compiled.json
+deployment-*.json
+parameters-*.json
+
+# Azure CLI
+.azure/
+
+# Environment variables
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+
+# Logs
+*.log
+
+# Secrets (never commit these)
+*secret*
+*password*
+*private_key*
+*.pem
+*.key
+
+# Temporary files
+tmp/
+temp/
+*.tmp
