@@ -2,7 +2,7 @@
 
 A production-ready, enterprise-grade Zero Trust implementation of Azure Container Registry with comprehensive AKS integration, security controls, and compliance capabilities.
 
-## 🏗️ Architecture Overview
+## Architecture Overview
 
 This solution implements a Zero Trust security model for container workloads with the following key components:
 
@@ -34,7 +34,7 @@ This solution implements a Zero Trust security model for container workloads wit
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## 🔒 Zero Trust Security Features
+## Zero Trust Security Features
 
 ### Network Security
 - **Private Endpoints Only** - No public access to ACR or AKS API server
@@ -66,7 +66,7 @@ This solution implements a Zero Trust security model for container workloads wit
 - **Security Analytics** - Falco runtime security monitoring
 - **Compliance Reporting** - Automated compliance dashboards
 
-## 📋 Regulatory Compliance
+## Regulatory Compliance
 
 This implementation addresses multiple compliance frameworks:
 
@@ -76,7 +76,7 @@ This implementation addresses multiple compliance frameworks:
 - **DORA** - Digital operational resilience
 - **NIS2** - Network and information security directive
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
@@ -137,7 +137,7 @@ kubectl get pods -A
 kubectl get policyreports -A
 ```
 
-## 📂 Repository Structure
+## Repository Structure
 
 ```
 ├── terraform/                    # Infrastructure as Code
@@ -174,7 +174,7 @@ kubectl get policyreports -A
     └── compliance-framework.md # Regulatory compliance details
 ```
 
-## 🛡️ Security Controls
+## Security Controls
 
 ### Image Security Pipeline
 
@@ -201,7 +201,7 @@ graph LR
 3. **Admission** - Kubernetes admission controller validation
 4. **Runtime** - Continuous monitoring and policy enforcement
 
-## 📊 Monitoring and Observability
+## Monitoring and Observability
 
 ### Dashboards Available
 
@@ -218,7 +218,7 @@ graph LR
 - Network security events
 - Compliance score and drift
 
-## 🔧 Configuration Options
+## Configuration Options
 
 ### ACR Configuration
 
@@ -252,7 +252,7 @@ background_scan: true
 policy_exceptions: []
 ```
 
-## 🔍 Troubleshooting
+## Troubleshooting
 
 ### Common Issues
 
@@ -280,7 +280,7 @@ policy_exceptions: []
    kubectl describe federatedidentity
    ```
 
-## 📚 Documentation
+## Documentation
 
 - [**Project Summary**](docs/PROJECT_SUMMARY.md) - Complete project overview, technologies used, and deliverables
 - [**Architecture Design**](docs/architecture-design.md) - Detailed technical architecture and design decisions
@@ -289,7 +289,7 @@ policy_exceptions: []
 - [**Security Policies**](docs/security-policies.md) - Security policies and procedures
 - [**Compliance Framework**](docs/compliance-framework.md) - Regulatory compliance details
 
-## 🤝 Contributing
+## Contributing
 
 1. Fork the repository
 2. Create a feature branch
@@ -297,34 +297,34 @@ policy_exceptions: []
 4. Ensure compliance checks pass
 5. Submit a pull request
 
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🆘 Support
+## Support
 
 - Create an [issue](../../issues) for bug reports
 - Join our [discussions](../../discussions) for questions
 - Review [documentation](docs/) for detailed guides
 - Check [troubleshooting](docs/deployment-guide.md#troubleshooting-common-issues) for common issues
 
-## 🏆 Features
+## Features
 
-- ✅ Zero Trust network architecture
-- ✅ Private endpoints and network isolation
-- ✅ Azure AD authentication and RBAC
-- ✅ Container image signing and verification
-- ✅ Vulnerability scanning and SBOM generation
-- ✅ Policy-based admission control
-- ✅ Comprehensive audit logging
-- ✅ Real-time security monitoring
-- ✅ Multi-framework compliance (ISO 27001, SOC 2, NIST, DORA, NIS2)
-- ✅ Infrastructure as Code (Terraform)
-- ✅ GitOps-ready deployment
-- ✅ Production-grade monitoring and alerting
-- ✅ Disaster recovery and high availability
-- ✅ Secure CI/CD pipeline integration
+- Zero Trust network architecture
+- Private endpoints and network isolation
+- Azure AD authentication and RBAC
+- Container image signing and verification
+- Vulnerability scanning and SBOM generation
+- Policy-based admission control
+- Comprehensive audit logging
+- Real-time security monitoring
+- Multi-framework compliance (ISO 27001, SOC 2, NIST, DORA, NIS2)
+- Infrastructure as Code (Terraform)
+- GitOps-ready deployment
+- Production-grade monitoring and alerting
+- Disaster recovery and high availability
+- Secure CI/CD pipeline integration
 
 ---
 
-**Built with 🔒 for enterprise security and 🚀 for developer productivity**
+**Built for enterprise security and developer productivity**
